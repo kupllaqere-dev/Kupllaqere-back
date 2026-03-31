@@ -21,7 +21,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Track connected players: socketId -> { id, name, x, y }
+// Track connected players: socketId -> { id, name, x, y, map }
 const players = new Map();
 
 // Chat history (last 50 messages)
@@ -40,25 +40,31 @@ io.on("connection", (socket) => {
 
   // Player joins the game with a name
   socket.on("player:join", (data) => {
+    const map = data.map || "main";
     const player = {
       id: socket.id,
       name: data.name || "Anonymous",
       x: data.x || 0,
       y: data.y || 0,
+      map,
     };
 
     players.set(socket.id, player);
+    socket.join(map);
 
-    // Send the new player the current game state
+    // Send the new player only the players on the same map
+    const playersOnMap = Array.from(players.values()).filter(
+      (p) => p.map === map
+    );
     socket.emit("game:state", {
       you: player,
-      players: Array.from(players.values()),
+      players: playersOnMap,
     });
 
-    // Tell everyone else about the new player
-    socket.broadcast.emit("player:joined", player);
+    // Tell others on the same map about the new player
+    socket.to(map).emit("player:joined", player);
 
-    console.log(`${player.name} joined (${players.size} players online)`);
+    console.log(`${player.name} joined map "${map}" (${players.size} players online)`);
   });
 
   // Player sends position/state update
@@ -71,8 +77,8 @@ io.on("connection", (socket) => {
     player.frame = data.frame ?? player.frame;
     player.direction = data.direction ?? player.direction;
 
-    // Broadcast to all other players
-    socket.broadcast.emit("player:updated", {
+    // Broadcast to other players on the same map
+    socket.to(player.map).emit("player:updated", {
       id: socket.id,
       x: player.x,
       y: player.y,
@@ -81,9 +87,56 @@ io.on("connection", (socket) => {
     });
   });
 
+  // Player teleports to a new location (optionally a different map)
+  socket.on("player:teleport", (data) => {
+    const player = players.get(socket.id);
+    if (!player) return;
+
+    const fromMap = player.map;
+    const toMap = data.map || fromMap;
+    const from = { x: player.x, y: player.y, map: fromMap };
+
+    player.x = data.x;
+    player.y = data.y;
+
+    // If changing maps, switch Socket.IO rooms
+    if (toMap !== fromMap) {
+      // Tell players on the old map this player disappeared
+      socket.to(fromMap).emit("player:left", { id: socket.id });
+      socket.leave(fromMap);
+
+      player.map = toMap;
+      socket.join(toMap);
+
+      // Tell players on the new map this player appeared
+      socket.to(toMap).emit("player:joined", player);
+    } else {
+      // Same map teleport — notify others on this map
+      socket.to(fromMap).emit("player:teleported", {
+        id: socket.id,
+        from,
+        to: { x: player.x, y: player.y, map: toMap },
+      });
+    }
+
+    // Send the teleporting player the new map's players
+    const playersOnNewMap = Array.from(players.values()).filter(
+      (p) => p.map === toMap
+    );
+    socket.emit("player:teleported", {
+      id: socket.id,
+      from,
+      to: { x: player.x, y: player.y, map: toMap },
+      players: playersOnNewMap,
+    });
+  });
+
   // Player sends a game action (attack, interact, etc.)
   socket.on("player:action", (data) => {
-    socket.broadcast.emit("player:action", {
+    const player = players.get(socket.id);
+    if (!player) return;
+
+    socket.to(player.map).emit("player:action", {
       id: socket.id,
       action: data.action,
       payload: data.payload,
@@ -148,7 +201,9 @@ io.on("connection", (socket) => {
     const player = players.get(socket.id);
     players.delete(socket.id);
 
-    io.emit("player:left", { id: socket.id });
+    if (player) {
+      socket.to(player.map).emit("player:left", { id: socket.id });
+    }
 
     console.log(
       `${player?.name || "Unknown"} disconnected (${players.size} players online)`
