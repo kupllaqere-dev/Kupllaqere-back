@@ -76,6 +76,7 @@ io.on("connection", (socket) => {
     player.y = data.y ?? player.y;
     player.frame = data.frame ?? player.frame;
     player.direction = data.direction ?? player.direction;
+    player.anim = data.anim ?? null;
 
     // Broadcast to other players on the same map
     socket.to(player.map).emit("player:updated", {
@@ -84,6 +85,7 @@ io.on("connection", (socket) => {
       y: player.y,
       frame: player.frame,
       direction: player.direction,
+      anim: player.anim,
     });
   });
 
