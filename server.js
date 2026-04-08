@@ -5,6 +5,30 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const authRoutes = require("./routes/auth");
+const itemRoutes = require("./routes/items");
+const User = require("./models/User");
+const Item = require("./models/Item");
+const { CATEGORY_SUBCATEGORIES } = require("./models/Item");
+
+// Build outfit object from a user's customization field
+async function buildOutfit(customization) {
+  const outfit = {};
+  if (!customization) return outfit;
+  for (const category of Object.keys(CATEGORY_SUBCATEGORIES)) {
+    const subs = customization[category];
+    if (!subs) continue;
+    for (const sub of Object.keys(subs)) {
+      const imageUrl = subs[sub];
+      if (!imageUrl) continue;
+      const item = await Item.findOne({ imageUrl, category, subcategory: sub }).lean();
+      if (item) {
+        outfit[category] = { itemId: item._id, imageUrl };
+        break;
+      }
+    }
+  }
+  return outfit;
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -30,6 +54,7 @@ const MAX_CHAT_HISTORY = 50;
 
 // Routes
 app.use("/api/auth", authRoutes);
+app.use("/api/items", itemRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", players: players.size });
@@ -39,7 +64,7 @@ io.on("connection", (socket) => {
   console.log(`Player connected: ${socket.id}`);
 
   // Player joins the game with a name
-  socket.on("player:join", (data) => {
+  socket.on("player:join", async (data) => {
     const map = data.map || "main";
     const player = {
       id: socket.id,
@@ -47,7 +72,20 @@ io.on("connection", (socket) => {
       x: data.x || 0,
       y: data.y || 0,
       map,
+      outfit: {},
     };
+
+    // Load outfit from DB if userId is provided
+    if (data.userId) {
+      try {
+        const user = await User.findById(data.userId).lean();
+        if (user) {
+          player.outfit = await buildOutfit(user.customization);
+        }
+      } catch (err) {
+        console.error("Failed to load outfit:", err);
+      }
+    }
 
     players.set(socket.id, player);
     socket.join(map);
@@ -142,6 +180,19 @@ io.on("connection", (socket) => {
       id: socket.id,
       action: data.action,
       payload: data.payload,
+    });
+  });
+
+  // Player updates their outfit
+  socket.on("player:outfit", (data) => {
+    const player = players.get(socket.id);
+    if (!player) return;
+
+    player.outfit = data.outfit || {};
+
+    socket.to(player.map).emit("player:outfit", {
+      id: socket.id,
+      outfit: player.outfit,
     });
   });
 

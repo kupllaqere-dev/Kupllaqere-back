@@ -16,6 +16,61 @@ const userSchema = new mongoose.Schema(
     avatar: { type: String, default: "" },
     isGuest: { type: Boolean, default: false },
     googleId: { type: String, unique: true, sparse: true },
+
+    // Currencies 
+    coins: { type: Number, default: 0 },
+    gems: { type: Number, default: 0 },
+
+    // Customization 
+    customization: {
+      tops: {
+        longSleeve: { type: String, default: null },
+        shortSleeve: { type: String, default: null },
+        sleeveless: { type: String, default: null },
+        baggy: { type: String, default: null },
+      },
+      bottoms: {
+        pants: { type: String, default: null },
+        skinny: { type: String, default: null },
+        shorts: { type: String, default: null },
+      },
+      coats: {
+        jackets: { type: String, default: null },
+        vests: { type: String, default: null },
+        hoodie: { type: String, default: null },
+      },
+      head: {
+        hats: { type: String, default: null },
+        sunglasses: { type: String, default: null },
+        decorations: { type: String, default: null },
+        horns: { type: String, default: null },
+        halos: { type: String, default: null },
+      },
+      hair: {
+        short: { type: String, default: null },
+        medium: { type: String, default: null },
+        long: { type: String, default: null },
+        facial: { type: String, default: null },
+      },
+      accessories: {
+        bracelets: { type: String, default: null },
+        belts: { type: String, default: null },
+        neckwear: { type: String, default: null },
+        necklace: { type: String, default: null },
+        bags: { type: String, default: null },
+        nails: { type: String, default: null },
+      },
+      feet: {
+        shoes: { type: String, default: null },
+        boots: { type: String, default: null },
+        slipOns: { type: String, default: null },
+        socks: { type: String, default: null },
+      },
+      hands: {
+        gloves: { type: String, default: null },
+        handheld: { type: String, default: null },
+      },
+    },
   },
   { timestamps: true },
 );
@@ -41,6 +96,9 @@ userSchema.methods.toPublic = function () {
     gender: this.gender,
     avatar: this.avatar,
     isGuest: this.isGuest,
+    coins: this.coins,
+    gems: this.gems,
+    customization: this.customization,
   };
   if (this.needsSetup()) obj.needsSetup = true;
   return obj;

@@ -2,6 +2,7 @@ const express = require("express");
 const jwt = require("jsonwebtoken");
 const { v4: uuidv4 } = require("uuid");
 const User = require("../models/User");
+const auth = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -9,21 +10,6 @@ function signToken(user) {
   return jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
     expiresIn: "7d",
   });
-}
-
-// Auth middleware for protected routes
-function auth(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) {
-    return res.status(401).json({ message: "No token provided." });
-  }
-  try {
-    const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET);
-    req.userId = decoded.id;
-    next();
-  } catch {
-    return res.status(401).json({ message: "Invalid token." });
-  }
 }
 
 // ── Register (email + password only, name/gender chosen later via /setup) ──
