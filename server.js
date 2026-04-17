@@ -48,6 +48,12 @@ app.use(express.json());
 // Track connected players: socketId -> { id, name, x, y, map }
 const players = new Map();
 
+// Set of player IDs whose position changed since last tick
+const dirtyPlayers = new Set();
+
+// Server tick rate: broadcast batched updates at this interval
+const TICK_RATE = 50; // ms (~20 ticks/sec)
+
 // Chat history (last 50 messages)
 const chatHistory = [];
 const MAX_CHAT_HISTORY = 50;
@@ -105,7 +111,7 @@ io.on("connection", (socket) => {
     console.log(`${player.name} joined map "${map}" (${players.size} players online)`);
   });
 
-  // Player sends position/state update
+  // Player sends position/state update (stored, broadcast in batched tick)
   socket.on("player:update", (data) => {
     const player = players.get(socket.id);
     if (!player) return;
@@ -116,15 +122,7 @@ io.on("connection", (socket) => {
     player.direction = data.direction ?? player.direction;
     player.anim = data.anim ?? null;
 
-    // Broadcast to other players on the same map
-    socket.to(player.map).emit("player:updated", {
-      id: socket.id,
-      x: player.x,
-      y: player.y,
-      frame: player.frame,
-      direction: player.direction,
-      anim: player.anim,
-    });
+    dirtyPlayers.add(socket.id);
   });
 
   // Player teleports to a new location (optionally a different map)
@@ -263,6 +261,37 @@ io.on("connection", (socket) => {
     );
   });
 });
+
+// Game loop: batch-broadcast dirty player positions per map
+setInterval(() => {
+  if (dirtyPlayers.size === 0) return;
+
+  // Group dirty players by map
+  const byMap = new Map();
+  for (const id of dirtyPlayers) {
+    const p = players.get(id);
+    if (!p) continue;
+    let list = byMap.get(p.map);
+    if (!list) {
+      list = [];
+      byMap.set(p.map, list);
+    }
+    list.push({
+      id: p.id,
+      x: p.x,
+      y: p.y,
+      frame: p.frame,
+      direction: p.direction,
+      anim: p.anim,
+    });
+  }
+  dirtyPlayers.clear();
+
+  // One emit per map with all updated players
+  for (const [map, updates] of byMap) {
+    io.to(map).emit("players:updated", updates);
+  }
+}, TICK_RATE);
 
 // Connect to MongoDB then start server
 mongoose
