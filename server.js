@@ -165,6 +165,7 @@ io.on("connection", (socket) => {
             onlineFriendSummaries = friendDocs.map((f) => ({
               id: String(f._id),
               name: f.name,
+              gender: f.gender,
               outfit: extractOutfitShallow(f.customization),
             }));
           }
@@ -175,6 +176,7 @@ io.on("connection", (socket) => {
             const mySummary = {
               id: String(user._id),
               name: user.name,
+              gender: user.gender,
               outfit: extractOutfitShallow(user.customization),
             };
             for (const fid of friendIds) {

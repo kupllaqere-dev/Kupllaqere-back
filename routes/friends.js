@@ -52,9 +52,9 @@ function notifyFriendsChanged(req, userIds) {
 router.get("/", auth, async (req, res) => {
   try {
     const user = await User.findById(req.userId)
-      .populate("friends", "name avatar customization")
-      .populate("friendRequestsReceived", "name avatar customization")
-      .populate("friendRequestsSent", "name avatar customization")
+      .populate("friends", "name avatar gender customization")
+      .populate("friendRequestsReceived", "name avatar gender customization")
+      .populate("friendRequestsSent", "name avatar gender customization")
       .lean();
 
     if (!user) return res.status(404).json({ message: "User not found." });
@@ -63,6 +63,7 @@ router.get("/", auth, async (req, res) => {
       id: f._id,
       name: f.name,
       avatar: f.avatar,
+      gender: f.gender,
       outfit: extractOutfit(f.customization),
       online: isOnline(f._id),
     }));
@@ -71,6 +72,7 @@ router.get("/", auth, async (req, res) => {
       id: f._id,
       name: f.name,
       avatar: f.avatar,
+      gender: f.gender,
       outfit: extractOutfit(f.customization),
     }));
 
@@ -78,6 +80,7 @@ router.get("/", auth, async (req, res) => {
       id: f._id,
       name: f.name,
       avatar: f.avatar,
+      gender: f.gender,
       outfit: extractOutfit(f.customization),
     }));
 
