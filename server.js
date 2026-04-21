@@ -139,6 +139,7 @@ io.on("connection", (socket) => {
       y: data.y || 0,
       map,
       outfit: {},
+      gender: data.gender === "male" ? "male" : "female",
     };
 
     // Load outfit from DB if userId is provided
@@ -147,6 +148,7 @@ io.on("connection", (socket) => {
         const user = await User.findById(data.userId).lean();
         if (user) {
           player.outfit = await buildOutfit(user.customization);
+          if (user.gender) player.gender = user.gender;
 
           const wasFirstSocket = addUserSocket(data.userId, socket.id);
 
