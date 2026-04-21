@@ -32,6 +32,23 @@ async function buildOutfit(customization) {
   return outfit;
 }
 
+// Lightweight outfit used for friend thumbnails — just the first imageUrl per category
+function extractOutfitShallow(customization) {
+  const outfit = {};
+  if (!customization) return outfit;
+  for (const [cat, subs] of Object.entries(customization)) {
+    if (!subs || typeof subs !== "object") continue;
+    for (const sub of Object.keys(subs)) {
+      const url = subs[sub];
+      if (url) {
+        outfit[cat] = { imageUrl: url };
+        break;
+      }
+    }
+  }
+  return outfit;
+}
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -50,6 +67,41 @@ app.use(express.json());
 // Track connected players: socketId -> { id, name, x, y, map }
 const players = new Map();
 
+// userId -> Set<socketId>
+const userIdToSocketIds = new Map();
+
+function addUserSocket(userId, socketId) {
+  if (!userId) return false;
+  const key = String(userId);
+  let set = userIdToSocketIds.get(key);
+  const firstConnection = !set;
+  if (!set) {
+    set = new Set();
+    userIdToSocketIds.set(key, set);
+  }
+  set.add(socketId);
+  return firstConnection;
+}
+
+function removeUserSocket(userId, socketId) {
+  if (!userId) return false;
+  const key = String(userId);
+  const set = userIdToSocketIds.get(key);
+  if (!set) return false;
+  set.delete(socketId);
+  if (set.size === 0) {
+    userIdToSocketIds.delete(key);
+    return true;
+  }
+  return false;
+}
+
+function socketsForUser(userId) {
+  if (!userId) return [];
+  const set = userIdToSocketIds.get(String(userId));
+  return set ? Array.from(set) : [];
+}
+
 // Set of player IDs whose position changed since last tick
 const dirtyPlayers = new Set();
 
@@ -59,6 +111,10 @@ const TICK_RATE = 50; // ms (~20 ticks/sec)
 // Chat history (last 50 messages)
 const chatHistory = [];
 const MAX_CHAT_HISTORY = 50;
+
+// Expose io + helpers to HTTP routes that need to push live events
+app.locals.io = io;
+app.locals.socketsForUser = socketsForUser;
 
 // Routes
 app.use("/api/auth", authRoutes);
@@ -91,6 +147,40 @@ io.on("connection", (socket) => {
         const user = await User.findById(data.userId).lean();
         if (user) {
           player.outfit = await buildOutfit(user.customization);
+
+          const wasFirstSocket = addUserSocket(data.userId, socket.id);
+
+          // Tell this client which of their friends are currently online
+          const friendIds = Array.isArray(user.friends) ? user.friends : [];
+          const onlineFriendIds = friendIds.filter((fid) =>
+            userIdToSocketIds.has(String(fid))
+          );
+          let onlineFriendSummaries = [];
+          if (onlineFriendIds.length) {
+            const friendDocs = await User.find({
+              _id: { $in: onlineFriendIds },
+            }).lean();
+            onlineFriendSummaries = friendDocs.map((f) => ({
+              id: String(f._id),
+              name: f.name,
+              outfit: extractOutfitShallow(f.customization),
+            }));
+          }
+          socket.emit("friends:online", onlineFriendSummaries);
+
+          // Tell this user's friends that I just came online
+          if (wasFirstSocket && friendIds.length) {
+            const mySummary = {
+              id: String(user._id),
+              name: user.name,
+              outfit: extractOutfitShallow(user.customization),
+            };
+            for (const fid of friendIds) {
+              for (const sid of socketsForUser(fid)) {
+                io.to(sid).emit("friend:online", mySummary);
+              }
+            }
+          }
         }
       } catch (err) {
         console.error("Failed to load outfit:", err);
@@ -258,7 +348,26 @@ io.on("connection", (socket) => {
     players.delete(socket.id);
 
     if (player) {
-      if (player.userId) online.remove(player.userId);
+      if (player.userId) {
+        online.remove(player.userId);
+        const wasLastSocket = removeUserSocket(player.userId, socket.id);
+        if (wasLastSocket) {
+          (async () => {
+            try {
+              const u = await User.findById(player.userId).lean();
+              if (!u || !Array.isArray(u.friends)) return;
+              const payload = { id: String(player.userId) };
+              for (const fid of u.friends) {
+                for (const sid of socketsForUser(fid)) {
+                  io.to(sid).emit("friend:offline", payload);
+                }
+              }
+            } catch (err) {
+              console.error("Friend offline notify failed:", err);
+            }
+          })();
+        }
+      }
       socket.to(player.map).emit("player:left", { id: socket.id });
     }
 

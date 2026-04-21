@@ -35,6 +35,19 @@ function publicSummary(user) {
   };
 }
 
+// Push a refresh signal to all of the given users' active sockets so their
+// clients can re-fetch their friends/presence state.
+function notifyFriendsChanged(req, userIds) {
+  const io = req.app.locals.io;
+  const socketsForUser = req.app.locals.socketsForUser;
+  if (!io || !socketsForUser) return;
+  for (const uid of userIds) {
+    for (const sid of socketsForUser(uid)) {
+      io.to(sid).emit("friends:refresh");
+    }
+  }
+}
+
 // ── GET /api/friends — list friends + pending requests ──
 router.get("/", auth, async (req, res) => {
   try {
@@ -111,6 +124,7 @@ router.post("/request", auth, async (req, res) => {
       me.friends.push(target._id);
       target.friends.push(me._id);
       await Promise.all([me.save(), target.save()]);
+      notifyFriendsChanged(req, [req.userId, targetId]);
       return res.json({ status: "accepted" });
     }
 
@@ -122,6 +136,7 @@ router.post("/request", auth, async (req, res) => {
     target.friendRequestsReceived.push(me._id);
     await Promise.all([me.save(), target.save()]);
 
+    notifyFriendsChanged(req, [req.userId, targetId]);
     res.json({ status: "sent" });
   } catch (err) {
     console.error("Send friend request error:", err);
@@ -166,6 +181,7 @@ router.post("/accept", auth, async (req, res) => {
     }
 
     await Promise.all([me.save(), other.save()]);
+    notifyFriendsChanged(req, [req.userId, userId]);
     res.json({ status: "accepted" });
   } catch (err) {
     console.error("Accept friend error:", err);
@@ -189,6 +205,7 @@ router.post("/decline", auth, async (req, res) => {
       $pull: { friendRequestsSent: req.userId },
     });
 
+    notifyFriendsChanged(req, [req.userId, userId]);
     res.json({ status: "declined" });
   } catch (err) {
     console.error("Decline friend error:", err);
@@ -212,6 +229,7 @@ router.post("/cancel", auth, async (req, res) => {
       $pull: { friendRequestsReceived: req.userId },
     });
 
+    notifyFriendsChanged(req, [req.userId, userId]);
     res.json({ status: "cancelled" });
   } catch (err) {
     console.error("Cancel friend error:", err);
@@ -231,6 +249,7 @@ router.delete("/:id", auth, async (req, res) => {
     await User.findByIdAndUpdate(req.userId, { $pull: { friends: id } });
     await User.findByIdAndUpdate(id, { $pull: { friends: req.userId } });
 
+    notifyFriendsChanged(req, [req.userId, id]);
     res.json({ status: "removed" });
   } catch (err) {
     console.error("Remove friend error:", err);
