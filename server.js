@@ -6,9 +6,11 @@ const cors = require("cors");
 const { Server } = require("socket.io");
 const authRoutes = require("./routes/auth");
 const itemRoutes = require("./routes/items");
+const friendRoutes = require("./routes/friends");
 const User = require("./models/User");
 const Item = require("./models/Item");
 const { CATEGORY_SUBCATEGORIES } = require("./models/Item");
+const online = require("./lib/online");
 
 // Build outfit object from a user's customization field
 async function buildOutfit(customization) {
@@ -61,6 +63,7 @@ const MAX_CHAT_HISTORY = 50;
 // Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/items", itemRoutes);
+app.use("/api/friends", friendRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", players: players.size });
@@ -74,6 +77,7 @@ io.on("connection", (socket) => {
     const map = data.map || "main";
     const player = {
       id: socket.id,
+      userId: data.userId || null,
       name: data.name || "Anonymous",
       x: data.x || 0,
       y: data.y || 0,
@@ -91,6 +95,7 @@ io.on("connection", (socket) => {
       } catch (err) {
         console.error("Failed to load outfit:", err);
       }
+      online.add(data.userId);
     }
 
     players.set(socket.id, player);
@@ -253,6 +258,7 @@ io.on("connection", (socket) => {
     players.delete(socket.id);
 
     if (player) {
+      if (player.userId) online.remove(player.userId);
       socket.to(player.map).emit("player:left", { id: socket.id });
     }
 

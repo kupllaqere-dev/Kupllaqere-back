@@ -17,9 +17,14 @@ const userSchema = new mongoose.Schema(
     isGuest: { type: Boolean, default: false },
     googleId: { type: String, unique: true, sparse: true },
 
-    // Currencies 
+    // Currencies
     coins: { type: Number, default: 0 },
     gems: { type: Number, default: 0 },
+
+    // Friends
+    friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
+    friendRequestsReceived: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
+    friendRequestsSent: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
 
     // Customization 
     customization: {

@@ -2,7 +2,8 @@ const mongoose = require("mongoose");
 
 const CATEGORY_SUBCATEGORIES = {
   tops: ["longSleeve", "shortSleeve", "sleeveless", "baggy"],
-  bottoms: ["pants", "skinny", "shorts"],
+  bottoms: ["pants", "skinny", "shorts", "skirt"],
+  onePiece: ["overall, dress"],
   coats: ["jackets", "vests", "hoodie"],
   head: ["hats", "sunglasses", "decorations", "horns", "halos"],
   hair: ["short", "medium", "long", "facial"],
@@ -14,6 +15,7 @@ const CATEGORY_SUBCATEGORIES = {
 const itemSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, maxlength: 40 },
+    gender: { type: String, enum: ["male", "female"] },
     category: {
       type: String,
       required: true,

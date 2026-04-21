@@ -1,10 +1,38 @@
 const express = require("express");
 const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
+const { OAuth2Client } = require("google-auth-library");
 const { v4: uuidv4 } = require("uuid");
 const User = require("../models/User");
 const auth = require("../middleware/auth");
 
 const router = express.Router();
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { message: "Too many login attempts. Try again in 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  message: { message: "Too many accounts created from this IP. Try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const guestLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: { message: "Too many guest sessions from this IP. Try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 function signToken(user) {
   return jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
@@ -13,7 +41,7 @@ function signToken(user) {
 }
 
 // ── Register (email + password only, name/gender chosen later via /setup) ──
-router.post("/register", async (req, res) => {
+router.post("/register", registerLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -45,7 +73,7 @@ router.post("/register", async (req, res) => {
 });
 
 // ── Login ──
-router.post("/login", async (req, res) => {
+router.post("/login", loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -73,7 +101,7 @@ router.post("/login", async (req, res) => {
 });
 
 // ── Guest ──
-router.post("/guest", async (req, res) => {
+router.post("/guest", guestLimiter, async (req, res) => {
   try {
     const guestName = `Guest_${uuidv4().slice(0, 6)}`;
     const user = await User.create({ name: guestName, isGuest: true });
@@ -87,19 +115,23 @@ router.post("/guest", async (req, res) => {
 });
 
 // ── Google ──
-router.post("/google", async (req, res) => {
+router.post("/google", loginLimiter, async (req, res) => {
   try {
     const { credential } = req.body;
     if (!credential) {
       return res.status(400).json({ message: "Missing Google credential." });
     }
 
-    // Decode the JWT from Google (header.payload.signature)
-    const payload = JSON.parse(
-      Buffer.from(credential.split(".")[1], "base64").toString(),
-    );
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
 
-    const { sub: googleId, email } = payload;
+    const { sub: googleId, email, email_verified } = payload;
+    if (!email_verified) {
+      return res.status(401).json({ message: "Google email not verified." });
+    }
 
     let user = await User.findOne({ googleId });
 
@@ -118,6 +150,10 @@ router.post("/google", async (req, res) => {
     const token = signToken(user);
     res.json({ user: user.toPublic(), token });
   } catch (err) {
+    if (err.message?.includes("Token") || err.message?.includes("audience")) {
+      return res.status(401).json({ message: "Invalid Google credential." });
+    }
+    console.error("Google login error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
