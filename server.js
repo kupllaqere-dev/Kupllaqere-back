@@ -387,6 +387,7 @@ setInterval(() => {
 
   // Group dirty players by map
   const byMap = new Map();
+  const dirtyIdsByMap = new Map();
   for (const id of dirtyPlayers) {
     const p = players.get(id);
     if (!p) continue;
@@ -394,6 +395,7 @@ setInterval(() => {
     if (!list) {
       list = [];
       byMap.set(p.map, list);
+      dirtyIdsByMap.set(p.map, new Set());
     }
     list.push({
       id: p.id,
@@ -403,12 +405,25 @@ setInterval(() => {
       direction: p.direction,
       anim: p.anim,
     });
+    dirtyIdsByMap.get(p.map).add(p.id);
   }
   dirtyPlayers.clear();
 
-  // One emit per map with all updated players
+  // Broadcast per map. For each dirty socket we exclude its own entry from
+  // the batch it receives — the client is authoritative for its own position,
+  // so echoing it back is wasted traffic and work.
   for (const [map, updates] of byMap) {
-    io.to(map).emit("players:updated", updates);
+    const dirtyIds = dirtyIdsByMap.get(map);
+    // Fast path: send full batch to non-dirty sockets on the map.
+    const excludeIds = Array.from(dirtyIds);
+    io.to(map).except(excludeIds).emit("players:updated", updates);
+    // For each dirty socket, send only the updates from other players.
+    for (const senderId of dirtyIds) {
+      const filtered = updates.filter((u) => u.id !== senderId);
+      if (filtered.length > 0) {
+        io.to(senderId).emit("players:updated", filtered);
+      }
+    }
   }
 }, TICK_RATE);
 
