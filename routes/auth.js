@@ -218,7 +218,9 @@ router.get("/user", auth, async (req, res) => {
 
     const user = await User.findOne({
       name: { $regex: `^${escapeRegex(name)}$`, $options: "i" },
-    }).lean();
+    })
+      .populate("soulMate", "name")
+      .lean();
 
     if (!user) return res.status(404).json({ message: "User not found." });
 
@@ -228,7 +230,11 @@ router.get("/user", auth, async (req, res) => {
         name: user.name,
         gender: user.gender,
         bio: user.bio || "",
+        selectedBadge: user.selectedBadge || null,
         outfit: extractOutfitShallow(user.customization),
+        soulMate: user.soulMate
+          ? { id: String(user.soulMate._id), name: user.soulMate.name }
+          : null,
       },
     });
   } catch (err) {
@@ -273,6 +279,41 @@ router.patch("/bio", auth, async (req, res) => {
     res.json({ bio: user.bio });
   } catch (err) {
     console.error("Bio update error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+const ALLOWED_BADGES = ["diamond", "flame", "medal", "paint", "verified"];
+
+// ── Update selected badge ──
+router.patch("/badge", auth, async (req, res) => {
+  try {
+    const { badge } = req.body;
+    if (badge !== null && !ALLOWED_BADGES.includes(badge)) {
+      return res.status(400).json({ message: "Invalid badge." });
+    }
+
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: "User not found." });
+
+    user.selectedBadge = badge;
+    await user.save();
+
+    const players = req.app.locals.players;
+    if (players) {
+      for (const p of players.values()) {
+        if (String(p.userId) === String(user._id)) p.selectedBadge = user.selectedBadge;
+      }
+    }
+
+    req.app.locals.io?.emit("player:badge", {
+      userId: String(user._id),
+      badge: user.selectedBadge,
+    });
+
+    res.json({ selectedBadge: user.selectedBadge });
+  } catch (err) {
+    console.error("Badge update error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });

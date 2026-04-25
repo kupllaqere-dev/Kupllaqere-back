@@ -7,6 +7,7 @@ const { Server } = require("socket.io");
 const authRoutes = require("./routes/auth");
 const itemRoutes = require("./routes/items");
 const friendRoutes = require("./routes/friends");
+const soulMateRoutes = require("./routes/soulmate");
 const User = require("./models/User");
 const Item = require("./models/Item");
 const { CATEGORY_SUBCATEGORIES } = require("./models/Item");
@@ -121,6 +122,7 @@ app.locals.players = players;
 app.use("/api/auth", authRoutes);
 app.use("/api/items", itemRoutes);
 app.use("/api/friends", friendRoutes);
+app.use("/api/soulmate", soulMateRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", players: players.size });
@@ -142,6 +144,7 @@ io.on("connection", (socket) => {
       outfit: {},
       gender: data.gender === "male" ? "male" : "female",
       bio: "",
+      selectedBadge: null,
     };
 
     // Load outfit from DB if userId is provided
@@ -152,6 +155,7 @@ io.on("connection", (socket) => {
           player.outfit = await buildOutfit(user.customization);
           if (user.gender) player.gender = user.gender;
           player.bio = user.bio || "";
+          player.selectedBadge = user.selectedBadge || null;
 
           const wasFirstSocket = addUserSocket(data.userId, socket.id);
 

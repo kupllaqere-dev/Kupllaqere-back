@@ -15,6 +15,11 @@ const userSchema = new mongoose.Schema(
     gender: { type: String, enum: ["male", "female"], default: "female" },
     avatar: { type: String, default: "" },
     bio: { type: String, default: "", maxlength: 500, trim: true },
+    selectedBadge: {
+      type: String,
+      enum: ["diamond", "flame", "medal", "paint", "verified", null],
+      default: null,
+    },
     isGuest: { type: Boolean, default: false },
     googleId: { type: String, unique: true, sparse: true },
 
@@ -26,6 +31,11 @@ const userSchema = new mongoose.Schema(
     friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
     friendRequestsReceived: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
     friendRequestsSent: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
+
+    // Soul mate (only one at a time)
+    soulMate: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    soulMateRequestSent: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    soulMateRequestsReceived: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
 
     // Customization 
     customization: {
@@ -102,10 +112,12 @@ userSchema.methods.toPublic = function () {
     gender: this.gender,
     avatar: this.avatar,
     bio: this.bio,
+    selectedBadge: this.selectedBadge,
     isGuest: this.isGuest,
     coins: this.coins,
     gems: this.gems,
     customization: this.customization,
+    soulMate: this.soulMate || null,
   };
   if (this.needsSetup()) obj.needsSetup = true;
   return obj;
