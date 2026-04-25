@@ -187,4 +187,94 @@ router.post("/setup", auth, async (req, res) => {
   }
 });
 
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractOutfitShallow(customization) {
+  const outfit = {};
+  if (!customization) return outfit;
+  for (const [cat, subs] of Object.entries(customization)) {
+    if (!subs || typeof subs !== "object") continue;
+    for (const sub of Object.keys(subs)) {
+      const url = subs[sub];
+      if (url) {
+        outfit[cat] = { imageUrl: url };
+        break;
+      }
+    }
+  }
+  return outfit;
+}
+
+// ── Lookup a user by exact (case-insensitive) name ──
+router.get("/user", auth, async (req, res) => {
+  try {
+    const name = (req.query.name || "").trim();
+    if (!name) return res.status(400).json({ message: "Name required." });
+    if (name.length > 100) {
+      return res.status(400).json({ message: "Name too long." });
+    }
+
+    const user = await User.findOne({
+      name: { $regex: `^${escapeRegex(name)}$`, $options: "i" },
+    }).lean();
+
+    if (!user) return res.status(404).json({ message: "User not found." });
+
+    res.json({
+      user: {
+        id: String(user._id),
+        name: user.name,
+        gender: user.gender,
+        bio: user.bio || "",
+        outfit: extractOutfitShallow(user.customization),
+      },
+    });
+  } catch (err) {
+    console.error("User lookup error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// ── Update bio ──
+router.patch("/bio", auth, async (req, res) => {
+  try {
+    const { bio } = req.body;
+    if (typeof bio !== "string") {
+      return res.status(400).json({ message: "Bio must be a string." });
+    }
+    const trimmed = bio.trim();
+    if (trimmed.length > 500) {
+      return res.status(400).json({ message: "Bio must be 500 characters or fewer." });
+    }
+
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: "User not found." });
+
+    user.bio = trimmed;
+    await user.save();
+
+    // Update in-memory player records so newly joining clients see the fresh
+    // bio without reloading the full user from DB
+    const players = req.app.locals.players;
+    if (players) {
+      for (const p of players.values()) {
+        if (String(p.userId) === String(user._id)) p.bio = user.bio;
+      }
+    }
+
+    // Notify everyone — clients that don't know this user just ignore
+    req.app.locals.io?.emit("player:bio", {
+      userId: String(user._id),
+      bio: user.bio,
+    });
+
+    res.json({ bio: user.bio });
+  } catch (err) {
+    console.error("Bio update error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
 module.exports = router;

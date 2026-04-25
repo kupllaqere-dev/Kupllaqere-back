@@ -115,6 +115,7 @@ const MAX_CHAT_HISTORY = 50;
 // Expose io + helpers to HTTP routes that need to push live events
 app.locals.io = io;
 app.locals.socketsForUser = socketsForUser;
+app.locals.players = players;
 
 // Routes
 app.use("/api/auth", authRoutes);
@@ -140,6 +141,7 @@ io.on("connection", (socket) => {
       map,
       outfit: {},
       gender: data.gender === "male" ? "male" : "female",
+      bio: "",
     };
 
     // Load outfit from DB if userId is provided
@@ -149,6 +151,7 @@ io.on("connection", (socket) => {
         if (user) {
           player.outfit = await buildOutfit(user.customization);
           if (user.gender) player.gender = user.gender;
+          player.bio = user.bio || "";
 
           const wasFirstSocket = addUserSocket(data.userId, socket.id);
 

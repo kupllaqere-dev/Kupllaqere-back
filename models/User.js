@@ -14,6 +14,7 @@ const userSchema = new mongoose.Schema(
     password: { type: String },
     gender: { type: String, enum: ["male", "female"], default: "female" },
     avatar: { type: String, default: "" },
+    bio: { type: String, default: "", maxlength: 500, trim: true },
     isGuest: { type: Boolean, default: false },
     googleId: { type: String, unique: true, sparse: true },
 
@@ -100,6 +101,7 @@ userSchema.methods.toPublic = function () {
     email: this.email,
     gender: this.gender,
     avatar: this.avatar,
+    bio: this.bio,
     isGuest: this.isGuest,
     coins: this.coins,
     gems: this.gems,
