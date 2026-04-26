@@ -9,6 +9,7 @@ const itemRoutes = require("./routes/items");
 const friendRoutes = require("./routes/friends");
 const soulMateRoutes = require("./routes/soulmate");
 const userRoutes = require("./routes/users");
+const mailRoutes = require("./routes/mail");
 const User = require("./models/User");
 const Item = require("./models/Item");
 const { CATEGORY_SUBCATEGORIES } = require("./models/Item");
@@ -125,6 +126,7 @@ app.use("/api/items", itemRoutes);
 app.use("/api/friends", friendRoutes);
 app.use("/api/soulmate", soulMateRoutes);
 app.use("/api/users", userRoutes);
+app.use("/api/mail", mailRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", players: players.size });
