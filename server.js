@@ -10,6 +10,7 @@ const friendRoutes = require("./routes/friends");
 const soulMateRoutes = require("./routes/soulmate");
 const userRoutes = require("./routes/users");
 const mailRoutes = require("./routes/mail");
+const adminRoutes = require("./routes/admin");
 const User = require("./models/User");
 const Item = require("./models/Item");
 const { CATEGORY_SUBCATEGORIES } = require("./models/Item");
@@ -127,10 +128,12 @@ app.use("/api/friends", friendRoutes);
 app.use("/api/soulmate", soulMateRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/mail", mailRoutes);
+app.use("/api/admin", adminRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", players: players.size });
 });
+
 
 io.on("connection", (socket) => {
   console.log(`Player connected: ${socket.id}`);
