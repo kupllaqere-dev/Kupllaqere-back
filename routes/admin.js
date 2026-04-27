@@ -27,6 +27,22 @@ const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function isPng(buf) { return buf.length >= 8 && buf.subarray(0, 8).equals(PNG_MAGIC); }
 function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
+async function createItemsFromSubmission(submission) {
+  const base = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
+  const tasks = submission.variants.map((variant) =>
+    new Item({
+      name: submission.name,
+      gender: submission.gender,
+      category: submission.category,
+      subcategory: submission.subcategory,
+      imageUrl: variant.imageUrl,
+      thumbnailUrl: variant.thumbnailUrl || "",
+      uploadedBy: submission.uploadedBy,
+    }).save()
+  );
+  return Promise.all(tasks);
+}
+
 // ── Stats ──────────────────────────────────────────────────────────────────
 router.get("/stats", async (req, res) => {
   try {
@@ -81,7 +97,7 @@ router.get("/players", async (req, res) => {
 
     const [players, total] = await Promise.all([
       User.find(filter)
-        .select("name email gender role isBanned isGuest coins gems createdAt selectedBadge")
+        .select("name email gender role roles isBanned isGuest coins gems createdAt selectedBadge")
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
@@ -91,7 +107,12 @@ router.get("/players", async (req, res) => {
 
     const onlineSet = new Set(online.onlineUserIds());
     res.json({
-      players: players.map((p) => ({ ...p, id: String(p._id), isOnline: onlineSet.has(String(p._id)) })),
+      players: players.map((p) => ({
+        ...p,
+        id: String(p._id),
+        roles: [...new Set([p.role, ...(p.roles || [])])],
+        isOnline: onlineSet.has(String(p._id)),
+      })),
       total, page, limit,
     });
   } catch (err) {
@@ -104,19 +125,31 @@ router.get("/players/:id", async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select("-password").lean();
     if (!user) return res.status(404).json({ message: "User not found." });
-    res.json({ player: { ...user, id: String(user._id), isOnline: online.isOnline(user._id) } });
+    res.json({ player: {
+      ...user,
+      id: String(user._id),
+      roles: [...new Set([user.role, ...(user.roles || [])])],
+      isOnline: online.isOnline(user._id),
+    }});
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
 });
 
+const VALID_ROLES = ["player", "admin", "creator"];
+
 router.patch("/players/:id", async (req, res) => {
   try {
-    const { role, isBanned, coins, gems, name } = req.body;
+    const { roles, isBanned, coins, gems, name } = req.body;
     const update = {};
-    if (role    !== undefined) {
-      if (!["player", "admin"].includes(role)) return res.status(400).json({ message: "Invalid role." });
-      update.role = role;
+
+    if (roles !== undefined) {
+      if (!Array.isArray(roles) || !roles.every((r) => VALID_ROLES.includes(r))) {
+        return res.status(400).json({ message: `Invalid roles. Allowed: ${VALID_ROLES.join(", ")}` });
+      }
+      // Keep primary role as the "highest" privilege
+      update.role  = roles.includes("admin") ? "admin" : roles.includes("player") ? "player" : "player";
+      update.roles = roles.filter((r) => r !== update.role);
     }
     if (isBanned !== undefined) update.isBanned = Boolean(isBanned);
     if (coins    !== undefined) update.coins    = Number(coins);
@@ -125,7 +158,11 @@ router.patch("/players/:id", async (req, res) => {
 
     const user = await User.findByIdAndUpdate(req.params.id, update, { new: true }).select("-password").lean();
     if (!user) return res.status(404).json({ message: "User not found." });
-    res.json({ player: { ...user, id: String(user._id) } });
+    res.json({ player: {
+      ...user,
+      id: String(user._id),
+      roles: [...new Set([user.role, ...(user.roles || [])])],
+    }});
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
@@ -254,32 +291,92 @@ router.get("/submissions", async (req, res) => {
     const filter = {};
     if (["pending", "approved", "declined"].includes(status)) filter.status = status;
 
-    const [submissions, total] = await Promise.all([
-      Submission.find(filter)
-        .populate("uploadedBy", "name email")
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean(),
-      Submission.countDocuments(filter),
-    ]);
+    // Fetch non-set submissions and the "first" of each set group
+    const allSubs = await Submission.find(filter)
+      .populate("uploadedBy", "name email")
+      .sort({ createdAt: -1 })
+      .lean();
 
-    res.json({ submissions: submissions.map((s) => ({ ...s, id: String(s._id) })), total, page, limit });
+    // Group sets by setCode, keep singles as-is
+    const seen = new Set();
+    const grouped = [];
+    for (const sub of allSubs) {
+      if (!sub.isSet) {
+        grouped.push({ ...sub, id: String(sub._id) });
+      } else {
+        if (!seen.has(sub.setCode)) {
+          seen.add(sub.setCode);
+          // Collect all items of this set (already in allSubs)
+          const setItems = allSubs
+            .filter((s) => s.setCode === sub.setCode)
+            .sort((a, b) => (a.setPosition ?? 0) - (b.setPosition ?? 0))
+            .map((s) => ({ ...s, id: String(s._id) }));
+          grouped.push({
+            isSet: true,
+            setCode: sub.setCode,
+            status: sub.status,
+            uploadedBy: sub.uploadedBy,
+            createdAt: sub.createdAt,
+            adminNote: sub.adminNote,
+            items: setItems,
+          });
+        }
+      }
+    }
+
+    const total = grouped.length;
+    const paginated = grouped.slice((page - 1) * limit, page * limit);
+
+    res.json({ submissions: paginated, total, page, limit });
   } catch (err) {
     console.error("Admin submissions error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
 
+// Approve/decline a single submission
 router.patch("/submissions/:id/status", async (req, res) => {
   try {
-    const { status } = req.body;
+    const { status, adminNote } = req.body;
     if (!["approved", "declined"].includes(status)) {
       return res.status(400).json({ message: "Status must be 'approved' or 'declined'." });
     }
-    const submission = await Submission.findByIdAndUpdate(req.params.id, { status }, { new: true }).lean();
+    const update = { status };
+    if (adminNote !== undefined) update.adminNote = String(adminNote).slice(0, 500);
+
+    const submission = await Submission.findByIdAndUpdate(req.params.id, update, { new: true }).lean();
     if (!submission) return res.status(404).json({ message: "Submission not found." });
+
+    if (status === "approved") {
+      await createItemsFromSubmission(submission);
+    }
+
     res.json({ submission: { ...submission, id: String(submission._id) } });
+  } catch (err) {
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// Approve/decline all items in a set at once
+router.patch("/submissions/set/:setCode/status", async (req, res) => {
+  try {
+    const { status, adminNote } = req.body;
+    if (!["approved", "declined"].includes(status)) {
+      return res.status(400).json({ message: "Status must be 'approved' or 'declined'." });
+    }
+    const update = { status };
+    if (adminNote !== undefined) update.adminNote = String(adminNote).slice(0, 500);
+
+    const submissions = await Submission.find({ setCode: req.params.setCode }).lean();
+    if (!submissions.length) return res.status(404).json({ message: "Set not found." });
+
+    await Submission.updateMany({ setCode: req.params.setCode }, update);
+
+    if (status === "approved") {
+      await Promise.all(submissions.map(createItemsFromSubmission));
+    }
+
+    res.json({ success: true, count: submissions.length });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }

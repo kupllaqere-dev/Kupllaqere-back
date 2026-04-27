@@ -23,6 +23,7 @@ const userSchema = new mongoose.Schema(
     isGuest: { type: Boolean, default: false },
     isBanned: { type: Boolean, default: false },
     role: { type: String, enum: ["player", "admin"], default: "player" },
+    roles: { type: [String], default: [] }, // extra roles beyond primary: "creator", etc.
     googleId: { type: String, unique: true, sparse: true },
 
     // Currencies
@@ -118,6 +119,7 @@ userSchema.methods.toPublic = function () {
     isGuest: this.isGuest,
     isBanned: this.isBanned,
     role: this.role,
+    roles: [...new Set([this.role, ...(this.roles || [])])],
     coins: this.coins,
     gems: this.gems,
     customization: this.customization,

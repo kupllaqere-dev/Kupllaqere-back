@@ -210,7 +210,7 @@ const VARIANT_FIELDS = Array.from({ length: 10 }, (_, i) => ({ name: `image_${i}
 
 router.post("/submit", auth, upload.fields(VARIANT_FIELDS), async (req, res) => {
   try {
-    const { name, category, subcategory } = req.body;
+    const { name, category, subcategory, gender } = req.body;
     let colors;
     try { colors = JSON.parse(req.body.colors || "[]"); } catch { colors = []; }
 
@@ -220,6 +220,7 @@ router.post("/submit", auth, upload.fields(VARIANT_FIELDS), async (req, res) => 
     const allowedSubs = CATEGORY_SUBCATEGORIES[category];
     if (!allowedSubs) return res.status(400).json({ message: "Invalid category." });
     if (!allowedSubs.includes(subcategory)) return res.status(400).json({ message: "Invalid subcategory." });
+    if (!["male", "female"].includes(gender)) return res.status(400).json({ message: "Gender must be 'male' or 'female'." });
 
     const files = req.files || {};
     const variantEntries = [];
@@ -239,6 +240,7 @@ router.post("/submit", auth, upload.fields(VARIANT_FIELDS), async (req, res) => 
       groupCode,
       category,
       subcategory,
+      gender,
       variants: [],
       uploadedBy: req.userId,
     });
