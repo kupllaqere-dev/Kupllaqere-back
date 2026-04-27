@@ -1,8 +1,11 @@
 const express = require("express");
 const multer = require("multer");
+const sharp = require("sharp");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { v4: uuidv4 } = require("uuid");
 const auth = require("../middleware/auth");
 const Item = require("../models/Item");
+const Submission = require("../models/Submission");
 const { CATEGORY_SUBCATEGORIES } = require("../models/Item");
 const User = require("../models/User");
 
@@ -70,18 +73,34 @@ router.post("/upload", auth, upload.single("image"), async (req, res) => {
       uploadedBy: req.userId,
     });
 
-    // Upload to S3 using the document _id as key
-    const key = `items/${item._id}.png`;
-    await s3.send(
-      new PutObjectCommand({
+    // Generate thumbnail: crop at x:0 y:4616 w:510 h:510, resize to 256x256
+    const thumbnailBuffer = await sharp(req.file.buffer)
+      .extract({ left: 0, top: 4616, width: 510, height: 510 })
+      .resize(256, 256)
+      .png()
+      .toBuffer();
+
+    // Upload full image and thumbnail to S3 in parallel
+    const key          = `items/${item._id}.png`;
+    const thumbnailKey = `item-thumbnails/${item._id}.png`;
+    await Promise.all([
+      s3.send(new PutObjectCommand({
         Bucket: process.env.AWS_BUCKET,
         Key: key,
         Body: req.file.buffer,
         ContentType: "image/png",
-      }),
-    );
+      })),
+      s3.send(new PutObjectCommand({
+        Bucket: process.env.AWS_BUCKET,
+        Key: thumbnailKey,
+        Body: thumbnailBuffer,
+        ContentType: "image/png",
+      })),
+    ]);
 
-    item.imageUrl = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+    const base = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
+    item.imageUrl     = `${base}/${key}`;
+    item.thumbnailUrl = `${base}/${thumbnailKey}`;
     await item.save();
 
     res.status(201).json({
@@ -91,6 +110,7 @@ router.post("/upload", auth, upload.single("image"), async (req, res) => {
         category: item.category,
         subcategory: item.subcategory,
         imageUrl: item.imageUrl,
+        thumbnailUrl: item.thumbnailUrl,
       },
     });
   } catch (err) {
@@ -181,6 +201,78 @@ router.put("/outfit", auth, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error("Update outfit error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// ── POST /api/items/submit — submit item group (up to 10 color variants) ──
+const VARIANT_FIELDS = Array.from({ length: 10 }, (_, i) => ({ name: `image_${i}`, maxCount: 1 }));
+
+router.post("/submit", auth, upload.fields(VARIANT_FIELDS), async (req, res) => {
+  try {
+    const { name, category, subcategory } = req.body;
+    let colors;
+    try { colors = JSON.parse(req.body.colors || "[]"); } catch { colors = []; }
+
+    if (!name || !name.trim()) return res.status(400).json({ message: "Name is required." });
+    if (name.trim().length > 40) return res.status(400).json({ message: "Name must be 40 characters or fewer." });
+
+    const allowedSubs = CATEGORY_SUBCATEGORIES[category];
+    if (!allowedSubs) return res.status(400).json({ message: "Invalid category." });
+    if (!allowedSubs.includes(subcategory)) return res.status(400).json({ message: "Invalid subcategory." });
+
+    const files = req.files || {};
+    const variantEntries = [];
+    for (let i = 0; i < 10; i++) {
+      const fileArr = files[`image_${i}`];
+      if (!fileArr || !fileArr[0]) continue;
+      const file = fileArr[0];
+      if (!isPng(file.buffer)) return res.status(400).json({ message: `Image ${i + 1} is not a valid PNG.` });
+      variantEntries.push({ index: i, file, color: colors[i] || "#ffffff" });
+    }
+
+    if (variantEntries.length === 0) return res.status(400).json({ message: "At least one image variant is required." });
+
+    const groupCode = uuidv4();
+    const submission = new Submission({
+      name: name.trim(),
+      groupCode,
+      category,
+      subcategory,
+      variants: [],
+      uploadedBy: req.userId,
+    });
+
+    const base = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
+
+    const uploadTasks = variantEntries.map(async ({ index, file, color }) => {
+      const thumbnailBuffer = await sharp(file.buffer)
+        .extract({ left: 0, top: 4616, width: 510, height: 510 })
+        .resize(256, 256)
+        .png()
+        .toBuffer();
+
+      const imgKey   = `submissions/${submission._id}/variant-${index}.png`;
+      const thumbKey = `submission-thumbnails/${submission._id}/variant-${index}.png`;
+
+      await Promise.all([
+        s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: imgKey, Body: file.buffer, ContentType: "image/png" })),
+        s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: thumbKey, Body: thumbnailBuffer, ContentType: "image/png" })),
+      ]);
+
+      return { index, color, imageUrl: `${base}/${imgKey}`, thumbnailUrl: `${base}/${thumbKey}` };
+    });
+
+    const uploaded = await Promise.all(uploadTasks);
+    uploaded.sort((a, b) => a.index - b.index);
+    submission.variants = uploaded.map(({ color, imageUrl, thumbnailUrl }) => ({ color, imageUrl, thumbnailUrl }));
+    await submission.save();
+
+    res.status(201).json({
+      submission: { id: submission._id, groupCode, name: submission.name, variantCount: submission.variants.length },
+    });
+  } catch (err) {
+    console.error("Submission error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });

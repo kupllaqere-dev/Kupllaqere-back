@@ -1,10 +1,12 @@
 const express = require("express");
 const multer = require("multer");
+const sharp = require("sharp");
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const requireAdmin = require("../middleware/admin");
 const User = require("../models/User");
 const Item = require("../models/Item");
 const Mail = require("../models/Mail");
+const Submission = require("../models/Submission");
 const { CATEGORY_SUBCATEGORIES } = require("../models/Item");
 const online = require("../lib/online");
 
@@ -181,14 +183,25 @@ router.post("/items", upload.single("image"), async (req, res) => {
     if (!isPng(req.file.buffer)) return res.status(400).json({ message: "Image must be a valid PNG." });
 
     const item = new Item({ name: name.trim(), category, subcategory, imageUrl: "", uploadedBy: req.userId });
-    const key  = `items/${item._id}.png`;
-    await s3.send(new PutObjectCommand({
-      Bucket: process.env.AWS_BUCKET, Key: key,
-      Body: req.file.buffer, ContentType: "image/png",
-    }));
-    item.imageUrl = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+
+    const thumbnailBuffer = await sharp(req.file.buffer)
+      .extract({ left: 0, top: 4616, width: 510, height: 510 })
+      .resize(256, 256)
+      .png()
+      .toBuffer();
+
+    const key          = `items/${item._id}.png`;
+    const thumbnailKey = `item-thumbnails/${item._id}.png`;
+    await Promise.all([
+      s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: key, Body: req.file.buffer, ContentType: "image/png" })),
+      s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: thumbnailKey, Body: thumbnailBuffer, ContentType: "image/png" })),
+    ]);
+
+    const base = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
+    item.imageUrl     = `${base}/${key}`;
+    item.thumbnailUrl = `${base}/${thumbnailKey}`;
     await item.save();
-    res.status(201).json({ item: { id: item._id, name: item.name, category: item.category, subcategory: item.subcategory, imageUrl: item.imageUrl } });
+    res.status(201).json({ item: { id: item._id, name: item.name, category: item.category, subcategory: item.subcategory, imageUrl: item.imageUrl, thumbnailUrl: item.thumbnailUrl } });
   } catch (err) {
     console.error("Admin item create error:", err);
     res.status(500).json({ message: "Server error." });
@@ -220,9 +233,53 @@ router.delete("/items/:id", async (req, res) => {
     const item = await Item.findByIdAndDelete(req.params.id).lean();
     if (!item) return res.status(404).json({ message: "Item not found." });
     try {
-      await s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `items/${item._id}.png` }));
+      await Promise.all([
+        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `items/${item._id}.png` })),
+        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `item-thumbnails/${item._id}.png` })),
+      ]);
     } catch { /* best-effort */ }
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// ── Submissions ────────────────────────────────────────────────────────────
+router.get("/submissions", async (req, res) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit  = Math.min(100, parseInt(req.query.limit) || 20);
+    const status = (req.query.status || "").trim();
+
+    const filter = {};
+    if (["pending", "approved", "declined"].includes(status)) filter.status = status;
+
+    const [submissions, total] = await Promise.all([
+      Submission.find(filter)
+        .populate("uploadedBy", "name email")
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Submission.countDocuments(filter),
+    ]);
+
+    res.json({ submissions: submissions.map((s) => ({ ...s, id: String(s._id) })), total, page, limit });
+  } catch (err) {
+    console.error("Admin submissions error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+router.patch("/submissions/:id/status", async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!["approved", "declined"].includes(status)) {
+      return res.status(400).json({ message: "Status must be 'approved' or 'declined'." });
+    }
+    const submission = await Submission.findByIdAndUpdate(req.params.id, { status }, { new: true }).lean();
+    if (!submission) return res.status(404).json({ message: "Submission not found." });
+    res.json({ submission: { ...submission, id: String(submission._id) } });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }

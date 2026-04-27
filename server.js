@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
+const path = require("path");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const { Server } = require("socket.io");
@@ -67,6 +68,7 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use("/assets", express.static(path.join(__dirname, "../fv-game/public/assets")));
 
 // Track connected players: socketId -> { id, name, x, y, map }
 const players = new Map();

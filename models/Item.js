@@ -23,6 +23,7 @@ const itemSchema = new mongoose.Schema(
     },
     subcategory: { type: String, required: true },
     imageUrl: { type: String, required: true },
+    thumbnailUrl: { type: String },
     uploadedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
