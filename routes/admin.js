@@ -247,7 +247,7 @@ router.post("/items", upload.single("image"), async (req, res) => {
 
 router.patch("/items/:id", async (req, res) => {
   try {
-    const { name, category, subcategory, gender } = req.body;
+    const { name, category, subcategory, gender, storeType } = req.body;
     const update = {};
     if (name !== undefined) update.name = String(name).trim().slice(0, 40);
     if (category !== undefined) {
@@ -256,6 +256,12 @@ router.patch("/items/:id", async (req, res) => {
     }
     if (subcategory !== undefined) update.subcategory = subcategory;
     if (gender !== undefined) update.gender = gender || undefined;
+    if (storeType !== undefined) {
+      if (storeType !== null && !["normal"].includes(storeType)) {
+        return res.status(400).json({ message: "Invalid storeType." });
+      }
+      update.storeType = storeType || null;
+    }
 
     const item = await Item.findByIdAndUpdate(req.params.id, update, { new: true }).lean();
     if (!item) return res.status(404).json({ message: "Item not found." });

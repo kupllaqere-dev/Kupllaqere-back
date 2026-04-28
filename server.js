@@ -13,6 +13,7 @@ const userRoutes = require("./routes/users");
 const mailRoutes = require("./routes/mail");
 const adminRoutes = require("./routes/admin");
 const creatorRoutes = require("./routes/creator");
+const storeRoutes = require("./routes/store");
 const User = require("./models/User");
 const Item = require("./models/Item");
 const { CATEGORY_SUBCATEGORIES } = require("./models/Item");
@@ -133,6 +134,7 @@ app.use("/api/users", userRoutes);
 app.use("/api/mail", mailRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/creator", creatorRoutes);
+app.use("/api/store", storeRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", players: players.size });

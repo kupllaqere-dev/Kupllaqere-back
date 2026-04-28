@@ -40,7 +40,10 @@ const userSchema = new mongoose.Schema(
     soulMateRequestSent: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     soulMateRequestsReceived: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
 
-    // Customization 
+    // Inventory
+    inventory: [{ type: mongoose.Schema.Types.ObjectId, ref: "Item" }],
+
+    // Customization
     customization: {
       tops: {
         longSleeve: { type: String, default: null },
