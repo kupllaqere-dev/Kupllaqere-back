@@ -25,6 +25,9 @@ const itemSchema = new mongoose.Schema(
     imageUrl: { type: String, required: true },
     thumbnailUrl: { type: String },
     storeType: { type: String, enum: ["normal"], default: null },
+    rarity: { type: String, enum: ["nonRare", "rare", "superRare"], default: null },
+    notes: { type: String, default: "" },
+    levelRequirement: { type: Number, default: null },
     uploadedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",

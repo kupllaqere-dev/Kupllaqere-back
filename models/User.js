@@ -26,6 +26,9 @@ const userSchema = new mongoose.Schema(
     roles: { type: [String], default: [] }, // extra roles beyond primary: "creator", etc.
     googleId: { type: String, unique: true, sparse: true },
 
+    // Level
+    level: { type: Number, default: 1 },
+
     // Currencies
     coins: { type: Number, default: 0 },
     gems: { type: Number, default: 0 },
@@ -123,6 +126,7 @@ userSchema.methods.toPublic = function () {
     isBanned: this.isBanned,
     role: this.role,
     roles: [...new Set([this.role, ...(this.roles || [])])],
+    level: this.level ?? 1,
     coins: this.coins,
     gems: this.gems,
     customization: this.customization,

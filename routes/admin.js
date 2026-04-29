@@ -247,7 +247,7 @@ router.post("/items", upload.single("image"), async (req, res) => {
 
 router.patch("/items/:id", async (req, res) => {
   try {
-    const { name, category, subcategory, gender, storeType } = req.body;
+    const { name, category, subcategory, gender, storeType, rarity, notes, levelRequirement } = req.body;
     const update = {};
     if (name !== undefined) update.name = String(name).trim().slice(0, 40);
     if (category !== undefined) {
@@ -262,6 +262,9 @@ router.patch("/items/:id", async (req, res) => {
       }
       update.storeType = storeType || null;
     }
+    if (rarity !== undefined) update.rarity = rarity || null;
+    if (notes !== undefined) update.notes = String(notes).slice(0, 500);
+    if (levelRequirement !== undefined) update.levelRequirement = levelRequirement ? Number(levelRequirement) : null;
 
     const item = await Item.findByIdAndUpdate(req.params.id, update, { new: true }).lean();
     if (!item) return res.status(404).json({ message: "Item not found." });

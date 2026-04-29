@@ -36,6 +36,9 @@ router.get("/", auth, async (req, res) => {
           _id: { name: "$name", category: "$category", subcategory: "$subcategory" },
           variants: { $push: { _id: "$_id", name: "$name", thumbnailUrl: "$thumbnailUrl", imageUrl: "$imageUrl", category: "$category", subcategory: "$subcategory", gender: "$gender" } },
           firstCreatedAt: { $min: "$createdAt" },
+          rarity: { $first: "$rarity" },
+          notes: { $first: "$notes" },
+          levelRequirement: { $first: "$levelRequirement" },
         },
       },
       { $sort: { firstCreatedAt: -1 } },
@@ -52,6 +55,9 @@ router.get("/", auth, async (req, res) => {
       name: g._id.name,
       category: g._id.category,
       subcategory: g._id.subcategory,
+      rarity: g.rarity || null,
+      notes: g.notes || "",
+      levelRequirement: g.levelRequirement ?? null,
       variants: g.variants,
     }));
 
