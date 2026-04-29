@@ -66,7 +66,7 @@ router.get("/", auth, async (req, res) => {
     }));
 
     const total = result?.totalCount?.[0]?.count || 0;
-    const ownedSet = new Set((user.inventory || []).map(String));
+    const ownedSet = new Set((user.inventory || []).map(e => String(e.itemId)));
 
     res.json({
       groups,
@@ -84,12 +84,28 @@ router.get("/", auth, async (req, res) => {
 // ── GET /api/store/inventory — player's owned items ──
 router.get("/inventory", auth, async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select("inventory").lean();
+    const user = await User.findById(req.userId)
+      .select("inventory")
+      .populate({ path: "inventory.itemId", select: "name category subcategory imageUrl thumbnailUrl gender levelRequirement" });
     if (!user) return res.status(404).json({ message: "User not found." });
 
-    const items = await Item.find({ _id: { $in: user.inventory || [] } })
-      .select("name category subcategory imageUrl thumbnailUrl gender")
-      .lean();
+    const items = (user.inventory || []).map(entry => {
+      const item = entry.itemId;
+      if (!item) return null;
+      return {
+        _id:              entry._id,
+        itemId:           String(item._id),
+        currency:         entry.currency,
+        amountPaid:       entry.amountPaid,
+        name:             item.name,
+        category:         item.category,
+        subcategory:      item.subcategory,
+        imageUrl:         item.imageUrl,
+        thumbnailUrl:     item.thumbnailUrl,
+        gender:           item.gender,
+        levelRequirement: item.levelRequirement ?? null,
+      };
+    }).filter(Boolean);
 
     res.json({ items });
   } catch (err) {
@@ -121,15 +137,10 @@ router.post("/purchase", auth, async (req, res) => {
 
     // Validate items exist and are in the store
     const dbItems = await Item.find({ _id: { $in: itemIds }, storeType: "normal" }).lean();
-    if (dbItems.length !== itemIds.length) {
+    const dbItemIds = new Set(dbItems.map((i) => String(i._id)));
+    const missingItems = itemIds.filter((id) => !dbItemIds.has(String(id)));
+    if (missingItems.length > 0) {
       return res.status(400).json({ message: "One or more items are not available in the store." });
-    }
-
-    // Check not already owned
-    const ownedSet = new Set((user.inventory || []).map(String));
-    const alreadyOwned = itemIds.filter((id) => ownedSet.has(String(id)));
-    if (alreadyOwned.length > 0) {
-      return res.status(400).json({ message: "You already own one or more of these items." });
     }
 
     // Calculate per-currency totals using item prices
@@ -160,8 +171,16 @@ router.post("/purchase", auth, async (req, res) => {
       return res.status(400).json({ message: `Not enough gems. Need ${totalGems}, have ${user.gems}.` });
     }
 
-    // Deduct and add to inventory
-    const updateOp = { $push: { inventory: { $each: itemIds } } };
+    // Deduct and add to inventory (one entry per purchase, recording currency and amount)
+    const inventoryEntries = purchaseItems.map(pi => {
+      const item = itemMap.get(String(pi.id));
+      return {
+        itemId:     pi.id,
+        currency:   pi.currency,
+        amountPaid: pi.currency === "coins" ? item.coinPrice : item.gemPrice,
+      };
+    });
+    const updateOp = { $push: { inventory: { $each: inventoryEntries } } };
     if (totalCoins > 0 || totalGems > 0) {
       updateOp.$inc = {};
       if (totalCoins > 0) updateOp.$inc.coins = -totalCoins;

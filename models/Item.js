@@ -3,7 +3,7 @@ const mongoose = require("mongoose");
 const CATEGORY_SUBCATEGORIES = {
   tops: ["longSleeve", "shortSleeve", "sleeveless", "baggy"],
   bottoms: ["pants", "skinny", "shorts", "skirt"],
-  onePiece: ["overall, dress"],
+  onePiece: ["overall", "dress"],
   coats: ["jackets", "vests", "hoodie"],
   head: ["hats", "sunglasses", "decorations", "horns", "halos"],
   hair: ["short", "medium", "long", "facial"],

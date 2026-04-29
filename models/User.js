@@ -43,8 +43,12 @@ const userSchema = new mongoose.Schema(
     soulMateRequestSent: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     soulMateRequestsReceived: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", default: [] }],
 
-    // Inventory
-    inventory: [{ type: mongoose.Schema.Types.ObjectId, ref: "Item" }],
+    // Inventory — each entry records the specific purchase
+    inventory: [{
+      itemId:     { type: mongoose.Schema.Types.ObjectId, ref: "Item", required: true },
+      currency:   { type: String, enum: ["coins", "gems"], required: true },
+      amountPaid: { type: Number, required: true },
+    }],
 
     // Customization
     customization: {
@@ -58,6 +62,7 @@ const userSchema = new mongoose.Schema(
         pants: { type: String, default: null },
         skinny: { type: String, default: null },
         shorts: { type: String, default: null },
+        skirt: {type: String, default: null},
       },
       coats: {
         jackets: { type: String, default: null },
