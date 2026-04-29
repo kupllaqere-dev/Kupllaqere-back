@@ -189,22 +189,63 @@ router.get("/items", async (req, res) => {
     const search   = (req.query.search   || "").trim();
     const category = (req.query.category || "").trim();
 
-    const filter = {};
-    if (search) filter.name = { $regex: escapeRegex(search), $options: "i" };
-    if (category && CATEGORY_SUBCATEGORIES[category]) filter.category = category;
+    const matchFilter = {};
+    if (search) matchFilter.name = { $regex: escapeRegex(search), $options: "i" };
+    if (category && CATEGORY_SUBCATEGORIES[category]) matchFilter.category = category;
 
-    const [items, total] = await Promise.all([
-      Item.find(filter)
-        .populate("uploadedBy", "name email")
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean(),
-      Item.countDocuments(filter),
-    ]);
+    const pipeline = [
+      { $match: matchFilter },
+      { $sort: { createdAt: -1 } },
+      {
+        $group: {
+          _id: { name: "$name", category: "$category" },
+          name:             { $first: "$name" },
+          category:         { $first: "$category" },
+          subcategory:      { $first: "$subcategory" },
+          rarity:           { $first: "$rarity" },
+          storeType:        { $first: "$storeType" },
+          levelRequirement: { $first: "$levelRequirement" },
+          notes:            { $first: "$notes" },
+          coinPrice:        { $first: "$coinPrice" },
+          gemPrice:         { $first: "$gemPrice" },
+          uploadedById:     { $first: "$uploadedBy" },
+          firstCreatedAt:   { $first: "$createdAt" },
+          variants: { $push: {
+            _id: "$_id", subcategory: "$subcategory", gender: "$gender",
+            imageUrl: "$imageUrl", thumbnailUrl: "$thumbnailUrl", createdAt: "$createdAt",
+          }},
+        },
+      },
+      { $sort: { firstCreatedAt: -1 } },
+      { $lookup: { from: "users", localField: "uploadedById", foreignField: "_id", as: "uploadedByArr" } },
+      {
+        $facet: {
+          groups:     [{ $skip: (page - 1) * limit }, { $limit: limit }],
+          totalCount: [{ $count: "count" }],
+        },
+      },
+    ];
 
-    res.json({ items: items.map((i) => ({ ...i, id: String(i._id) })), total, page, limit });
+    const [result] = await Item.aggregate(pipeline);
+    const groups = (result?.groups || []).map((g) => ({
+      name:             g.name,
+      category:         g.category,
+      subcategory:      g.subcategory,
+      rarity:           g.rarity || null,
+      storeType:        g.storeType || null,
+      levelRequirement: g.levelRequirement ?? null,
+      notes:            g.notes || "",
+      coinPrice:        g.coinPrice ?? null,
+      gemPrice:         g.gemPrice ?? null,
+      uploadedBy:       g.uploadedByArr?.[0] ? { name: g.uploadedByArr[0].name, email: g.uploadedByArr[0].email } : null,
+      createdAt:        g.firstCreatedAt,
+      variants:         g.variants.map((v) => ({ ...v, id: String(v._id) })),
+    }));
+
+    const total = result?.totalCount?.[0]?.count || 0;
+    res.json({ groups, total, page, limit });
   } catch (err) {
+    console.error("Admin items error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
@@ -245,9 +286,32 @@ router.post("/items", upload.single("image"), async (req, res) => {
   }
 });
 
+// ── Group-level update (must be before /:id) ──────────────────────────────
+router.patch("/items/group", async (req, res) => {
+  try {
+    const { name, category, newName, rarity, storeType, levelRequirement, notes, coinPrice, gemPrice } = req.body;
+    if (!name || !category) return res.status(400).json({ message: "name and category are required." });
+
+    const update = {};
+    if (newName !== undefined) update.name = String(newName).trim().slice(0, 40);
+    if (rarity !== undefined) update.rarity = rarity || null;
+    if (storeType !== undefined) update.storeType = storeType || null;
+    if (levelRequirement !== undefined) update.levelRequirement = levelRequirement !== null && levelRequirement !== "" ? Number(levelRequirement) : null;
+    if (notes !== undefined) update.notes = String(notes).slice(0, 500);
+    if (coinPrice !== undefined) update.coinPrice = coinPrice !== null && coinPrice !== "" ? Number(coinPrice) : null;
+    if (gemPrice !== undefined) update.gemPrice = gemPrice !== null && gemPrice !== "" ? Number(gemPrice) : null;
+
+    const result = await Item.updateMany({ name, category }, update);
+    res.json({ success: true, modifiedCount: result.modifiedCount });
+  } catch (err) {
+    console.error("Admin group update error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
 router.patch("/items/:id", async (req, res) => {
   try {
-    const { name, category, subcategory, gender, storeType, rarity, notes, levelRequirement } = req.body;
+    const { name, category, subcategory, gender, storeType, rarity, notes, levelRequirement, coinPrice, gemPrice } = req.body;
     const update = {};
     if (name !== undefined) update.name = String(name).trim().slice(0, 40);
     if (category !== undefined) {
@@ -265,11 +329,33 @@ router.patch("/items/:id", async (req, res) => {
     if (rarity !== undefined) update.rarity = rarity || null;
     if (notes !== undefined) update.notes = String(notes).slice(0, 500);
     if (levelRequirement !== undefined) update.levelRequirement = levelRequirement ? Number(levelRequirement) : null;
+    if (coinPrice !== undefined) update.coinPrice = coinPrice !== null && coinPrice !== "" ? Number(coinPrice) : null;
+    if (gemPrice !== undefined) update.gemPrice = gemPrice !== null && gemPrice !== "" ? Number(gemPrice) : null;
 
     const item = await Item.findByIdAndUpdate(req.params.id, update, { new: true }).lean();
     if (!item) return res.status(404).json({ message: "Item not found." });
     res.json({ item: { ...item, id: String(item._id) } });
   } catch (err) {
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// ── Group-level delete (must be before /:id) ───────────────────────────────
+router.delete("/items/group", async (req, res) => {
+  try {
+    const { name, category } = req.query;
+    if (!name || !category) return res.status(400).json({ message: "name and category are required." });
+
+    const items = await Item.find({ name, category }).lean();
+    await Promise.allSettled(items.flatMap((item) => [
+      s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `items/${item._id}.png` })),
+      s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `item-thumbnails/${item._id}.png` })),
+    ]));
+
+    const result = await Item.deleteMany({ name, category });
+    res.json({ success: true, deletedCount: result.deletedCount });
+  } catch (err) {
+    console.error("Admin group delete error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });

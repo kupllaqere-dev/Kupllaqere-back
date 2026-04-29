@@ -28,6 +28,8 @@ const itemSchema = new mongoose.Schema(
     rarity: { type: String, enum: ["nonRare", "rare", "superRare"], default: null },
     notes: { type: String, default: "" },
     levelRequirement: { type: Number, default: null },
+    coinPrice: { type: Number, default: null },
+    gemPrice: { type: Number, default: null },
     uploadedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",

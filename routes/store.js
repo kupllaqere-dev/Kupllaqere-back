@@ -36,9 +36,11 @@ router.get("/", auth, async (req, res) => {
           _id: { name: "$name", category: "$category", subcategory: "$subcategory" },
           variants: { $push: { _id: "$_id", name: "$name", thumbnailUrl: "$thumbnailUrl", imageUrl: "$imageUrl", category: "$category", subcategory: "$subcategory", gender: "$gender" } },
           firstCreatedAt: { $min: "$createdAt" },
-          rarity: { $first: "$rarity" },
-          notes: { $first: "$notes" },
+          rarity:           { $first: "$rarity" },
+          notes:            { $first: "$notes" },
           levelRequirement: { $first: "$levelRequirement" },
+          coinPrice:        { $first: "$coinPrice" },
+          gemPrice:         { $first: "$gemPrice" },
         },
       },
       { $sort: { firstCreatedAt: -1 } },
@@ -52,13 +54,15 @@ router.get("/", auth, async (req, res) => {
 
     const [result] = await Item.aggregate(pipeline);
     const groups = (result?.groups || []).map((g) => ({
-      name: g._id.name,
-      category: g._id.category,
-      subcategory: g._id.subcategory,
-      rarity: g.rarity || null,
-      notes: g.notes || "",
+      name:             g._id.name,
+      category:         g._id.category,
+      subcategory:      g._id.subcategory,
+      rarity:           g.rarity || null,
+      notes:            g.notes || "",
       levelRequirement: g.levelRequirement ?? null,
-      variants: g.variants,
+      coinPrice:        g.coinPrice ?? null,
+      gemPrice:         g.gemPrice ?? null,
+      variants:         g.variants,
     }));
 
     const total = result?.totalCount?.[0]?.count || 0;
@@ -95,23 +99,29 @@ router.get("/inventory", auth, async (req, res) => {
 });
 
 // ── POST /api/store/purchase — buy items ──
+// Body: { items: [{ id, currency: "coins"|"gems" }] }
 router.post("/purchase", auth, async (req, res) => {
   try {
-    const { itemIds, currency } = req.body;
+    const { items: purchaseItems } = req.body;
 
-    if (!Array.isArray(itemIds) || itemIds.length === 0) {
-      return res.status(400).json({ message: "itemIds array is required." });
+    if (!Array.isArray(purchaseItems) || purchaseItems.length === 0) {
+      return res.status(400).json({ message: "items array is required." });
     }
-    if (!["coins", "gems"].includes(currency)) {
-      return res.status(400).json({ message: "currency must be 'coins' or 'gems'." });
+    const validCurrencies = ["coins", "gems"];
+    for (const pi of purchaseItems) {
+      if (!pi.id || !validCurrencies.includes(pi.currency)) {
+        return res.status(400).json({ message: "Each item must have an id and currency ('coins' or 'gems')." });
+      }
     }
 
     const user = await User.findById(req.userId).select("coins gems inventory");
     if (!user) return res.status(404).json({ message: "User not found." });
 
+    const itemIds = purchaseItems.map((pi) => pi.id);
+
     // Validate items exist and are in the store
-    const items = await Item.find({ _id: { $in: itemIds }, storeType: "normal" }).lean();
-    if (items.length !== itemIds.length) {
+    const dbItems = await Item.find({ _id: { $in: itemIds }, storeType: "normal" }).lean();
+    if (dbItems.length !== itemIds.length) {
       return res.status(400).json({ message: "One or more items are not available in the store." });
     }
 
@@ -122,32 +132,47 @@ router.post("/purchase", auth, async (req, res) => {
       return res.status(400).json({ message: "You already own one or more of these items." });
     }
 
-    // Each item costs 1 coin or 1 gem
-    const cost = itemIds.length;
-    if (currency === "coins" && user.coins < cost) {
-      return res.status(400).json({ message: `Not enough coins. Need ${cost}, have ${user.coins}.` });
-    }
-    if (currency === "gems" && user.gems < cost) {
-      return res.status(400).json({ message: `Not enough gems. Need ${cost}, have ${user.gems}.` });
+    // Calculate per-currency totals using item prices
+    const itemMap = new Map(dbItems.map((i) => [String(i._id), i]));
+    let totalCoins = 0;
+    let totalGems  = 0;
+
+    for (const pi of purchaseItems) {
+      const item = itemMap.get(String(pi.id));
+      if (!item) continue;
+      if (pi.currency === "coins") {
+        if (item.coinPrice === null || item.coinPrice === undefined) {
+          return res.status(400).json({ message: `"${item.name}" has no coin price.` });
+        }
+        totalCoins += item.coinPrice;
+      } else {
+        if (item.gemPrice === null || item.gemPrice === undefined) {
+          return res.status(400).json({ message: `"${item.name}" has no gem price.` });
+        }
+        totalGems += item.gemPrice;
+      }
     }
 
-    // Deduct cost and add to inventory
-    const update = {
-      $push: { inventory: { $each: itemIds } },
-    };
-    if (currency === "coins") update.$inc = { coins: -cost };
-    else update.$inc = { gems: -cost };
+    if (user.coins < totalCoins) {
+      return res.status(400).json({ message: `Not enough coins. Need ${totalCoins}, have ${user.coins}.` });
+    }
+    if (user.gems < totalGems) {
+      return res.status(400).json({ message: `Not enough gems. Need ${totalGems}, have ${user.gems}.` });
+    }
 
-    const updated = await User.findByIdAndUpdate(req.userId, update, { new: true })
+    // Deduct and add to inventory
+    const updateOp = { $push: { inventory: { $each: itemIds } } };
+    if (totalCoins > 0 || totalGems > 0) {
+      updateOp.$inc = {};
+      if (totalCoins > 0) updateOp.$inc.coins = -totalCoins;
+      if (totalGems  > 0) updateOp.$inc.gems  = -totalGems;
+    }
+
+    const updated = await User.findByIdAndUpdate(req.userId, updateOp, { new: true })
       .select("coins gems inventory")
       .lean();
 
-    res.json({
-      success: true,
-      coins: updated.coins,
-      gems: updated.gems,
-      purchasedIds: itemIds,
-    });
+    res.json({ success: true, coins: updated.coins, gems: updated.gems, purchasedIds: itemIds });
   } catch (err) {
     console.error("Purchase error:", err);
     res.status(500).json({ message: "Server error." });
