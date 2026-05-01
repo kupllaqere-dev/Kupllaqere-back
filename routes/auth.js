@@ -293,11 +293,12 @@ router.patch("/badge", auth, async (req, res) => {
       return res.status(400).json({ message: "Invalid badge." });
     }
 
-    const user = await User.findById(req.userId);
+    const user = await User.findByIdAndUpdate(
+      req.userId,
+      { $set: { selectedBadge: badge } },
+      { new: true }
+    );
     if (!user) return res.status(404).json({ message: "User not found." });
-
-    user.selectedBadge = badge;
-    await user.save();
 
     const players = req.app.locals.players;
     if (players) {
