@@ -17,7 +17,7 @@ function isPng(buf) { return buf.length >= 8 && buf.subarray(0, 8).equals(PNG_MA
 
 async function createItemsFromSubmission(submission) {
   const inserts = (submission.variants || []).map((variant) => ({
-    id:            uuidv4(),
+    id:            variant.itemId || uuidv4(),
     name:          submission.name,
     gender:        submission.gender,
     category:      submission.category,
@@ -252,15 +252,18 @@ router.post("/items", upload.single("image"), async (req, res) => {
 
     const itemId = uuidv4();
 
-    const thumbnailBuffer = await sharp(req.file.buffer)
-      .extract({ left: 0, top: 4616, width: 510, height: 510 })
-      .resize(256, 256)
-      .png()
-      .toBuffer();
+    const [webpBuffer, thumbnailBuffer] = await Promise.all([
+      sharp(req.file.buffer).webp({ quality: 85 }).toBuffer(),
+      sharp(req.file.buffer)
+        .extract({ left: 0, top: 4616, width: 510, height: 510 })
+        .resize(256, 256)
+        .webp({ quality: 85 })
+        .toBuffer(),
+    ]);
 
     const [imageUrl, thumbnailUrl] = await Promise.all([
-      uploadFile(`items/${itemId}.png`, req.file.buffer),
-      uploadFile(`item-thumbnails/${itemId}.png`, thumbnailBuffer),
+      uploadFile(`items/${itemId}.webp`, webpBuffer, "image/webp"),
+      uploadFile(`item-thumbnails/${itemId}.webp`, thumbnailBuffer, "image/webp"),
     ]);
 
     const { data: item, error } = await supabase
@@ -357,8 +360,8 @@ router.delete("/items/group", async (req, res) => {
     const { data: items } = await supabase.from("items").select("id").eq("name", name).eq("category", category);
 
     const paths = (items || []).flatMap((item) => [
-      `items/${item.id}.png`,
-      `item-thumbnails/${item.id}.png`,
+      `items/${item.id}.webp`,
+      `item-thumbnails/${item.id}.webp`,
     ]);
     await deleteFiles(paths);
 
@@ -380,7 +383,7 @@ router.delete("/items/:id", async (req, res) => {
       .select("id")
       .single();
     if (error || !item) return res.status(404).json({ message: "Item not found." });
-    await deleteFiles([`items/${item.id}.png`, `item-thumbnails/${item.id}.png`]);
+    await deleteFiles([`items/${item.id}.webp`, `item-thumbnails/${item.id}.webp`]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Server error." });

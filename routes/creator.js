@@ -14,19 +14,24 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 *
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function isPng(buf) { return buf.length >= 8 && buf.subarray(0, 8).equals(PNG_MAGIC); }
 
-async function uploadVariant(fileBuffer, submissionId, variantIndex) {
-  const thumbnailBuffer = await sharp(fileBuffer)
-    .extract({ left: 0, top: 4616, width: 510, height: 510 })
-    .resize(256, 256)
-    .png()
-    .toBuffer();
+async function uploadVariant(fileBuffer) {
+  const itemId = uuidv4();
 
-  const [imageUrl, thumbnailUrl] = await Promise.all([
-    uploadFile(`submissions/${submissionId}/variant-${variantIndex}.png`, fileBuffer),
-    uploadFile(`submission-thumbnails/${submissionId}/variant-${variantIndex}.png`, thumbnailBuffer),
+  const [webpBuffer, thumbnailBuffer] = await Promise.all([
+    sharp(fileBuffer).webp({ quality: 85 }).toBuffer(),
+    sharp(fileBuffer)
+      .extract({ left: 0, top: 4616, width: 510, height: 510 })
+      .resize(256, 256)
+      .webp({ quality: 85 })
+      .toBuffer(),
   ]);
 
-  return { imageUrl, thumbnailUrl };
+  const [imageUrl, thumbnailUrl] = await Promise.all([
+    uploadFile(`items/${itemId}.webp`, webpBuffer, "image/webp"),
+    uploadFile(`item-thumbnails/${itemId}.webp`, thumbnailBuffer, "image/webp"),
+  ]);
+
+  return { itemId, imageUrl, thumbnailUrl };
 }
 
 // GET /api/creator/me
@@ -133,12 +138,12 @@ router.post("/submit", upload.fields([...SINGLE_FIELDS, ...SET_FIELDS]), async (
 
       const uploaded = await Promise.all(
         variantFiles.map(async ({ index, file }) => {
-          const urls = await uploadVariant(file.buffer, submissionId, index);
+          const urls = await uploadVariant(file.buffer);
           return { index, ...urls };
         })
       );
       uploaded.sort((a, b) => a.index - b.index);
-      const variants = uploaded.map(({ imageUrl, thumbnailUrl }) => ({ imageUrl, thumbnailUrl }));
+      const variants = uploaded.map(({ itemId, imageUrl, thumbnailUrl }) => ({ itemId, imageUrl, thumbnailUrl }));
 
       const { data: submission, error } = await supabase
         .from("submissions")
@@ -191,12 +196,12 @@ router.post("/submit", upload.fields([...SINGLE_FIELDS, ...SET_FIELDS]), async (
 
         const uploaded = await Promise.all(
           variantFiles.map(async ({ index, file }) => {
-            const urls = await uploadVariant(file.buffer, submissionId, index);
+            const urls = await uploadVariant(file.buffer);
             return { index, ...urls };
           })
         );
         uploaded.sort((a, b) => a.index - b.index);
-        const variants = uploaded.map(({ imageUrl, thumbnailUrl }) => ({ imageUrl, thumbnailUrl }));
+        const variants = uploaded.map(({ itemId, imageUrl, thumbnailUrl }) => ({ itemId, imageUrl, thumbnailUrl }));
 
         submissions.push({
           id:           submissionId,
@@ -293,15 +298,16 @@ router.post("/submissions/:id/variant/:idx", upload.single("image"), async (req,
     if (sub.status === "approved") return res.status(400).json({ message: "Cannot edit an approved submission." });
     if (!req.file || !isPng(req.file.buffer)) return res.status(400).json({ message: "A valid PNG image is required." });
 
-    const { imageUrl, thumbnailUrl } = await uploadVariant(req.file.buffer, sub.id, variantIdx);
+    const { itemId, imageUrl, thumbnailUrl } = await uploadVariant(req.file.buffer);
 
     const variants = [...(sub.variants || [])];
     if (variants[variantIdx]) {
-      variants[variantIdx].imageUrl    = imageUrl;
+      variants[variantIdx].itemId       = itemId;
+      variants[variantIdx].imageUrl     = imageUrl;
       variants[variantIdx].thumbnailUrl = thumbnailUrl;
     } else {
       while (variants.length <= variantIdx) variants.push(null);
-      variants[variantIdx] = { imageUrl, thumbnailUrl };
+      variants[variantIdx] = { itemId, imageUrl, thumbnailUrl };
     }
 
     const update = { variants };

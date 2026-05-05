@@ -38,15 +38,18 @@ router.post("/upload", auth, upload.single("image"), async (req, res) => {
 
     const itemId = uuidv4();
 
-    const thumbnailBuffer = await sharp(req.file.buffer)
-      .extract({ left: 0, top: 4616, width: 510, height: 510 })
-      .resize(256, 256)
-      .png()
-      .toBuffer();
+    const [webpBuffer, thumbnailBuffer] = await Promise.all([
+      sharp(req.file.buffer).webp({ quality: 85 }).toBuffer(),
+      sharp(req.file.buffer)
+        .extract({ left: 0, top: 4616, width: 510, height: 510 })
+        .resize(256, 256)
+        .webp({ quality: 85 })
+        .toBuffer(),
+    ]);
 
     const [imageUrl, thumbnailUrl] = await Promise.all([
-      uploadFile(`items/${itemId}.png`, req.file.buffer),
-      uploadFile(`item-thumbnails/${itemId}.png`, thumbnailBuffer),
+      uploadFile(`items/${itemId}.webp`, webpBuffer, "image/webp"),
+      uploadFile(`item-thumbnails/${itemId}.webp`, thumbnailBuffer, "image/webp"),
     ]);
 
     const { data: item, error } = await supabase
@@ -213,23 +216,28 @@ router.post("/submit", auth, upload.fields(VARIANT_FIELDS), async (req, res) => 
     const groupCode    = uuidv4();
 
     const uploadTasks = variantEntries.map(async ({ index, file, color }) => {
-      const thumbnailBuffer = await sharp(file.buffer)
-        .extract({ left: 0, top: 4616, width: 510, height: 510 })
-        .resize(256, 256)
-        .png()
-        .toBuffer();
+      const variantItemId = uuidv4();
 
-      const [imageUrl, thumbnailUrl] = await Promise.all([
-        uploadFile(`submissions/${submissionId}/variant-${index}.png`, file.buffer),
-        uploadFile(`submission-thumbnails/${submissionId}/variant-${index}.png`, thumbnailBuffer),
+      const [webpBuffer, thumbnailBuffer] = await Promise.all([
+        sharp(file.buffer).webp({ quality: 85 }).toBuffer(),
+        sharp(file.buffer)
+          .extract({ left: 0, top: 4616, width: 510, height: 510 })
+          .resize(256, 256)
+          .webp({ quality: 85 })
+          .toBuffer(),
       ]);
 
-      return { index, color, imageUrl, thumbnailUrl };
+      const [imageUrl, thumbnailUrl] = await Promise.all([
+        uploadFile(`items/${variantItemId}.webp`, webpBuffer, "image/webp"),
+        uploadFile(`item-thumbnails/${variantItemId}.webp`, thumbnailBuffer, "image/webp"),
+      ]);
+
+      return { index, color, itemId: variantItemId, imageUrl, thumbnailUrl };
     });
 
     const uploaded = await Promise.all(uploadTasks);
     uploaded.sort((a, b) => a.index - b.index);
-    const variants = uploaded.map(({ color, imageUrl, thumbnailUrl }) => ({ color, imageUrl, thumbnailUrl }));
+    const variants = uploaded.map(({ color, itemId, imageUrl, thumbnailUrl }) => ({ color, itemId, imageUrl, thumbnailUrl }));
 
     const { data: submission, error } = await supabase
       .from("submissions")
