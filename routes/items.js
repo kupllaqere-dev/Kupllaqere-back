@@ -1,21 +1,13 @@
 const express = require("express");
 const multer = require("multer");
 const sharp = require("sharp");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 const { v4: uuidv4 } = require("uuid");
 const auth = require("../middleware/auth");
 const supabase = require("../lib/supabase");
+const { uploadFile } = require("../lib/storage");
 const { CATEGORY_SUBCATEGORIES } = require("../lib/categories");
 
 const router = express.Router();
-
-const s3 = new S3Client({
-  region: process.env.AWS_REGION,
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  },
-});
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -26,9 +18,6 @@ const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function isPng(buffer) {
   return buffer.length >= 8 && buffer.subarray(0, 8).equals(PNG_MAGIC);
 }
-
-const S3_BASE = () =>
-  `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
 
 // POST /api/items/upload
 router.post("/upload", auth, upload.single("image"), async (req, res) => {
@@ -47,7 +36,6 @@ router.post("/upload", auth, upload.single("image"), async (req, res) => {
     if (!req.file) return res.status(400).json({ message: "Image file is required." });
     if (!isPng(req.file.buffer)) return res.status(400).json({ message: "Image must be a valid PNG file." });
 
-    // Generate UUID before S3 upload so we can use it as the S3 key
     const itemId = uuidv4();
 
     const thumbnailBuffer = await sharp(req.file.buffer)
@@ -56,15 +44,11 @@ router.post("/upload", auth, upload.single("image"), async (req, res) => {
       .png()
       .toBuffer();
 
-    const key          = `items/${itemId}.png`;
-    const thumbnailKey = `item-thumbnails/${itemId}.png`;
-
-    await Promise.all([
-      s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: key, Body: req.file.buffer, ContentType: "image/png" })),
-      s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: thumbnailKey, Body: thumbnailBuffer, ContentType: "image/png" })),
+    const [imageUrl, thumbnailUrl] = await Promise.all([
+      uploadFile(`items/${itemId}.png`, req.file.buffer),
+      uploadFile(`item-thumbnails/${itemId}.png`, thumbnailBuffer),
     ]);
 
-    const base = S3_BASE();
     const { data: item, error } = await supabase
       .from("items")
       .insert({
@@ -72,8 +56,8 @@ router.post("/upload", auth, upload.single("image"), async (req, res) => {
         name:          name.trim(),
         category,
         subcategory,
-        image_url:     `${base}/${key}`,
-        thumbnail_url: `${base}/${thumbnailKey}`,
+        image_url:     imageUrl,
+        thumbnail_url: thumbnailUrl,
         uploaded_by:   req.userId,
       })
       .select()
@@ -173,7 +157,6 @@ router.put("/outfit", auth, async (req, res) => {
       itemEntries.push({ category, item });
     }
 
-    // Build full customization object: clear all slots, then fill equipped
     const customization = {};
     for (const category of Object.keys(CATEGORY_SUBCATEGORIES)) {
       customization[category] = {};
@@ -228,7 +211,6 @@ router.post("/submit", auth, upload.fields(VARIANT_FIELDS), async (req, res) => 
 
     const submissionId = uuidv4();
     const groupCode    = uuidv4();
-    const base         = S3_BASE();
 
     const uploadTasks = variantEntries.map(async ({ index, file, color }) => {
       const thumbnailBuffer = await sharp(file.buffer)
@@ -237,15 +219,12 @@ router.post("/submit", auth, upload.fields(VARIANT_FIELDS), async (req, res) => 
         .png()
         .toBuffer();
 
-      const imgKey   = `submissions/${submissionId}/variant-${index}.png`;
-      const thumbKey = `submission-thumbnails/${submissionId}/variant-${index}.png`;
-
-      await Promise.all([
-        s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: imgKey, Body: file.buffer, ContentType: "image/png" })),
-        s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: thumbKey, Body: thumbnailBuffer, ContentType: "image/png" })),
+      const [imageUrl, thumbnailUrl] = await Promise.all([
+        uploadFile(`submissions/${submissionId}/variant-${index}.png`, file.buffer),
+        uploadFile(`submission-thumbnails/${submissionId}/variant-${index}.png`, thumbnailBuffer),
       ]);
 
-      return { index, color, imageUrl: `${base}/${imgKey}`, thumbnailUrl: `${base}/${thumbKey}` };
+      return { index, color, imageUrl, thumbnailUrl };
     });
 
     const uploaded = await Promise.all(uploadTasks);

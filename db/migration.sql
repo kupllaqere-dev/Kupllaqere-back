@@ -133,10 +133,21 @@ CREATE TABLE IF NOT EXISTS mail (
   to_id      UUID        NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
   subject    TEXT        NOT NULL DEFAULT '',
   body       TEXT        NOT NULL,
-  is_read    BOOLEAN     NOT NULL DEFAULT false,
+  read       BOOLEAN     NOT NULL DEFAULT false,
   parent_id  UUID        REFERENCES mail(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Rename is_read → read if this table was created before this fix
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'mail' AND column_name = 'is_read'
+  ) THEN
+    ALTER TABLE mail RENAME COLUMN is_read TO read;
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_mail_to_id     ON mail(to_id);
 CREATE INDEX IF NOT EXISTS idx_mail_from_id   ON mail(from_id);
 CREATE INDEX IF NOT EXISTS idx_mail_thread_id ON mail(thread_id);
@@ -159,6 +170,7 @@ CREATE INDEX IF NOT EXISTS idx_guestbook_author  ON guestbook_comments(author_id
 CREATE TABLE IF NOT EXISTS submissions (
   id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   name         TEXT        NOT NULL,
+  group_code   TEXT,
   gender       TEXT,
   category     TEXT        NOT NULL,
   subcategory  TEXT        NOT NULL,
@@ -171,6 +183,9 @@ CREATE TABLE IF NOT EXISTS submissions (
   variants     JSONB       NOT NULL DEFAULT '[]',
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Add group_code if table already existed without it
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS group_code TEXT;
 CREATE INDEX IF NOT EXISTS idx_submissions_status   ON submissions(status);
 CREATE INDEX IF NOT EXISTS idx_submissions_set_code ON submissions(set_code);
 

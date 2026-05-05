@@ -96,7 +96,7 @@ router.get("/unread-count", auth, async (req, res) => {
     if (error) throw error;
     res.json({ count: count || 0 });
   } catch (err) {
-    console.error("Unread count error:", err);
+    console.error("Unread count error:", JSON.stringify(err), err);
     res.status(500).json({ message: "Server error." });
   }
 });

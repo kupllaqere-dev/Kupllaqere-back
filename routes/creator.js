@@ -1,28 +1,18 @@
 const express = require("express");
 const multer = require("multer");
 const sharp = require("sharp");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 const { v4: uuidv4 } = require("uuid");
 const requireCreator = require("../middleware/creator");
 const supabase = require("../lib/supabase");
+const { uploadFile } = require("../lib/storage");
 const { CATEGORY_SUBCATEGORIES } = require("../lib/categories");
 
 const router = express.Router();
 router.use(requireCreator);
 
-const s3 = new S3Client({
-  region: process.env.AWS_REGION,
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  },
-});
-
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function isPng(buf) { return buf.length >= 8 && buf.subarray(0, 8).equals(PNG_MAGIC); }
-
-const S3_BASE = () => `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
 
 async function uploadVariant(fileBuffer, submissionId, variantIndex) {
   const thumbnailBuffer = await sharp(fileBuffer)
@@ -31,18 +21,12 @@ async function uploadVariant(fileBuffer, submissionId, variantIndex) {
     .png()
     .toBuffer();
 
-  const imgKey   = `submissions/${submissionId}/variant-${variantIndex}.png`;
-  const thumbKey = `submission-thumbnails/${submissionId}/variant-${variantIndex}.png`;
-
-  await Promise.all([
-    s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: imgKey, Body: fileBuffer, ContentType: "image/png" })),
-    s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: thumbKey, Body: thumbnailBuffer, ContentType: "image/png" })),
+  const [imageUrl, thumbnailUrl] = await Promise.all([
+    uploadFile(`submissions/${submissionId}/variant-${variantIndex}.png`, fileBuffer),
+    uploadFile(`submission-thumbnails/${submissionId}/variant-${variantIndex}.png`, thumbnailBuffer),
   ]);
 
-  return {
-    imageUrl:     `${S3_BASE()}/${imgKey}`,
-    thumbnailUrl: `${S3_BASE()}/${thumbKey}`,
-  };
+  return { imageUrl, thumbnailUrl };
 }
 
 // GET /api/creator/me

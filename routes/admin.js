@@ -1,29 +1,19 @@
 const express = require("express");
 const multer = require("multer");
 const sharp = require("sharp");
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { v4: uuidv4 } = require("uuid");
 const requireAdmin = require("../middleware/admin");
 const supabase = require("../lib/supabase");
+const { uploadFile, deleteFiles } = require("../lib/storage");
 const { CATEGORY_SUBCATEGORIES } = require("../lib/categories");
 const online = require("../lib/online");
 
 const router = express.Router();
 router.use(requireAdmin);
 
-const s3 = new S3Client({
-  region: process.env.AWS_REGION,
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  },
-});
-
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function isPng(buf) { return buf.length >= 8 && buf.subarray(0, 8).equals(PNG_MAGIC); }
-
-const S3_BASE = () => `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
 
 async function createItemsFromSubmission(submission) {
   const inserts = (submission.variants || []).map((variant) => ({
@@ -66,7 +56,6 @@ router.get("/stats", async (req, res) => {
       supabase.from("profiles").select("created_at").gte("created_at", start30d),
     ]);
 
-    // Group by day in JS
     const byDay = {};
     for (const { created_at } of regs30d || []) {
       const date = created_at.slice(0, 10);
@@ -185,7 +174,6 @@ router.delete("/players/:id", async (req, res) => {
     if (req.params.id === req.userId) {
       return res.status(400).json({ message: "Cannot delete your own account." });
     }
-    // Delete from Supabase Auth (also cascades profile via FK)
     const { error } = await supabase.auth.admin.deleteUser(req.params.id);
     if (error) return res.status(404).json({ message: "User not found." });
     res.json({ success: true });
@@ -210,7 +198,6 @@ router.get("/items", async (req, res) => {
     const { data: allItems, error } = await query;
     if (error) throw error;
 
-    // Group by name + category (JavaScript-side)
     const groupMap = new Map();
     for (const item of allItems || []) {
       const key = `${item.name}||${item.category}`;
@@ -271,13 +258,9 @@ router.post("/items", upload.single("image"), async (req, res) => {
       .png()
       .toBuffer();
 
-    const key          = `items/${itemId}.png`;
-    const thumbnailKey = `item-thumbnails/${itemId}.png`;
-    const base         = S3_BASE();
-
-    await Promise.all([
-      s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: key, Body: req.file.buffer, ContentType: "image/png" })),
-      s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: thumbnailKey, Body: thumbnailBuffer, ContentType: "image/png" })),
+    const [imageUrl, thumbnailUrl] = await Promise.all([
+      uploadFile(`items/${itemId}.png`, req.file.buffer),
+      uploadFile(`item-thumbnails/${itemId}.png`, thumbnailBuffer),
     ]);
 
     const { data: item, error } = await supabase
@@ -287,8 +270,8 @@ router.post("/items", upload.single("image"), async (req, res) => {
         name:          name.trim(),
         category,
         subcategory,
-        image_url:     `${base}/${key}`,
-        thumbnail_url: `${base}/${thumbnailKey}`,
+        image_url:     imageUrl,
+        thumbnail_url: thumbnailUrl,
         uploaded_by:   req.userId,
       })
       .select()
@@ -373,12 +356,11 @@ router.delete("/items/group", async (req, res) => {
 
     const { data: items } = await supabase.from("items").select("id").eq("name", name).eq("category", category);
 
-    await Promise.allSettled(
-      (items || []).flatMap((item) => [
-        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `items/${item.id}.png` })),
-        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `item-thumbnails/${item.id}.png` })),
-      ])
-    );
+    const paths = (items || []).flatMap((item) => [
+      `items/${item.id}.png`,
+      `item-thumbnails/${item.id}.png`,
+    ]);
+    await deleteFiles(paths);
 
     const { error } = await supabase.from("items").delete().eq("name", name).eq("category", category);
     if (error) throw error;
@@ -398,12 +380,7 @@ router.delete("/items/:id", async (req, res) => {
       .select("id")
       .single();
     if (error || !item) return res.status(404).json({ message: "Item not found." });
-    try {
-      await Promise.all([
-        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `items/${item.id}.png` })),
-        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `item-thumbnails/${item.id}.png` })),
-      ]);
-    } catch { /* best-effort */ }
+    await deleteFiles([`items/${item.id}.png`, `item-thumbnails/${item.id}.png`]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
