@@ -1,79 +1,91 @@
 const express = require("express");
 const auth = require("../middleware/auth");
-const Item = require("../models/Item");
-const User = require("../models/User");
+const supabase = require("../lib/supabase");
 
 const router = express.Router();
 
-// ── GET /api/store — items grouped by name (gender-filtered, paginated) ──
+// ── GET /api/store ─────────────────────────────────────────
 router.get("/", auth, async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select("gender inventory").lean();
-    if (!user) return res.status(404).json({ message: "User not found." });
+    const { data: profile, error: pErr } = await supabase
+      .from("profiles")
+      .select("gender")
+      .eq("id", req.userId)
+      .single();
+    if (pErr || !profile) return res.status(404).json({ message: "User not found." });
 
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = 50;
+    const page     = Math.max(1, parseInt(req.query.page) || 1);
+    const limit    = 50;
     const category = (req.query.category || "").trim();
 
-    const matchFilter = { storeType: "normal" };
+    // Fetch store items filtered by gender and optionally category
+    let query = supabase
+      .from("items")
+      .select("*")
+      .eq("store_type", "normal")
+      .order("created_at", { ascending: true });
 
-    // Gender filter: show items matching player's gender or gender-neutral items
-    if (user.gender) {
-      matchFilter.$or = [
-        { gender: user.gender },
-        { gender: null },
-        { gender: { $exists: false } },
-      ];
+    if (profile.gender) {
+      query = query.or(`gender.eq.${profile.gender},gender.is.null`);
+    }
+    if (category) query = query.eq("category", category);
+
+    const { data: allItems, error: itemsErr } = await query;
+    if (itemsErr) throw itemsErr;
+
+    // Group by name + category + subcategory (JavaScript-side aggregation)
+    const groupMap = new Map();
+    for (const item of allItems || []) {
+      const key = `${item.name}||${item.category}||${item.subcategory}`;
+      if (!groupMap.has(key)) {
+        groupMap.set(key, {
+          name:             item.name,
+          category:         item.category,
+          subcategory:      item.subcategory,
+          rarity:           item.rarity || null,
+          notes:            item.notes || "",
+          levelRequirement: item.level_requirement ?? null,
+          coinPrice:        item.coin_price ?? null,
+          gemPrice:         item.gem_price ?? null,
+          firstCreatedAt:   item.created_at,
+          variants:         [],
+        });
+      }
+      const group = groupMap.get(key);
+      group.variants.push({
+        _id:          item.id,
+        name:         item.name,
+        thumbnailUrl: item.thumbnail_url,
+        imageUrl:     item.image_url,
+        category:     item.category,
+        subcategory:  item.subcategory,
+        gender:       item.gender,
+      });
+      // Keep earliest createdAt for sort
+      if (item.created_at < group.firstCreatedAt) group.firstCreatedAt = item.created_at;
     }
 
-    if (category) matchFilter.category = category;
+    // Sort newest-first (by first variant creation time)
+    const sorted = Array.from(groupMap.values()).sort(
+      (a, b) => new Date(b.firstCreatedAt) - new Date(a.firstCreatedAt)
+    );
 
-    const pipeline = [
-      { $match: matchFilter },
-      { $sort: { createdAt: 1 } },
-      {
-        $group: {
-          _id: { name: "$name", category: "$category", subcategory: "$subcategory" },
-          variants: { $push: { _id: "$_id", name: "$name", thumbnailUrl: "$thumbnailUrl", imageUrl: "$imageUrl", category: "$category", subcategory: "$subcategory", gender: "$gender" } },
-          firstCreatedAt: { $min: "$createdAt" },
-          rarity:           { $first: "$rarity" },
-          notes:            { $first: "$notes" },
-          levelRequirement: { $first: "$levelRequirement" },
-          coinPrice:        { $first: "$coinPrice" },
-          gemPrice:         { $first: "$gemPrice" },
-        },
-      },
-      { $sort: { firstCreatedAt: -1 } },
-      {
-        $facet: {
-          groups: [{ $skip: (page - 1) * limit }, { $limit: limit }],
-          totalCount: [{ $count: "count" }],
-        },
-      },
-    ];
+    const total  = sorted.length;
+    const groups = sorted.slice((page - 1) * limit, page * limit).map(({ firstCreatedAt, ...g }) => g);
 
-    const [result] = await Item.aggregate(pipeline);
-    const groups = (result?.groups || []).map((g) => ({
-      name:             g._id.name,
-      category:         g._id.category,
-      subcategory:      g._id.subcategory,
-      rarity:           g.rarity || null,
-      notes:            g.notes || "",
-      levelRequirement: g.levelRequirement ?? null,
-      coinPrice:        g.coinPrice ?? null,
-      gemPrice:         g.gemPrice ?? null,
-      variants:         g.variants,
-    }));
-
-    const total = result?.totalCount?.[0]?.count || 0;
-    const ownedSet = new Set((user.inventory || []).map(e => String(e.itemId)));
+    // Get owned item IDs
+    const { data: inventoryRows } = await supabase
+      .from("inventory")
+      .select("item_id")
+      .eq("user_id", req.userId);
+    const ownedIds = (inventoryRows || []).map((r) => r.item_id);
 
     res.json({
       groups,
       total,
       page,
-      hasMore: page * limit < total,
-      ownedIds: [...ownedSet],
+      hasMore:  page * limit < total,
+      ownedIds,
     });
   } catch (err) {
     console.error("Store fetch error:", err);
@@ -81,31 +93,46 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-// ── GET /api/store/inventory — player's owned items ──
+// ── GET /api/store/inventory ──────────────────────────────
 router.get("/inventory", auth, async (req, res) => {
   try {
-    const user = await User.findById(req.userId)
-      .select("inventory")
-      .populate({ path: "inventory.itemId", select: "name category subcategory imageUrl thumbnailUrl gender levelRequirement" });
-    if (!user) return res.status(404).json({ message: "User not found." });
+    const { data: rows, error } = await supabase
+      .from("inventory")
+      .select(`
+        id,
+        item_id,
+        currency,
+        amount_paid,
+        acquired_at,
+        items (
+          id,
+          name,
+          category,
+          subcategory,
+          image_url,
+          thumbnail_url,
+          gender,
+          level_requirement
+        )
+      `)
+      .eq("user_id", req.userId);
+    if (error) throw error;
 
-    const items = (user.inventory || []).map(entry => {
-      const item = entry.itemId;
-      if (!item) return null;
-      return {
-        _id:              entry._id,
-        itemId:           String(item._id),
-        currency:         entry.currency,
-        amountPaid:       entry.amountPaid,
-        name:             item.name,
-        category:         item.category,
-        subcategory:      item.subcategory,
-        imageUrl:         item.imageUrl,
-        thumbnailUrl:     item.thumbnailUrl,
-        gender:           item.gender,
-        levelRequirement: item.levelRequirement ?? null,
-      };
-    }).filter(Boolean);
+    const items = (rows || [])
+      .filter((r) => r.items)
+      .map((r) => ({
+        _id:              r.id,
+        itemId:           r.item_id,
+        currency:         r.currency,
+        amountPaid:       r.amount_paid,
+        name:             r.items.name,
+        category:         r.items.category,
+        subcategory:      r.items.subcategory,
+        imageUrl:         r.items.image_url,
+        thumbnailUrl:     r.items.thumbnail_url,
+        gender:           r.items.gender,
+        levelRequirement: r.items.level_requirement ?? null,
+      }));
 
     res.json({ items });
   } catch (err) {
@@ -114,8 +141,7 @@ router.get("/inventory", auth, async (req, res) => {
   }
 });
 
-// ── POST /api/store/purchase — buy items ──
-// Body: { items: [{ id, currency: "coins"|"gems" }] }
+// ── POST /api/store/purchase ──────────────────────────────
 router.post("/purchase", auth, async (req, res) => {
   try {
     const { items: purchaseItems } = req.body;
@@ -130,66 +156,83 @@ router.post("/purchase", auth, async (req, res) => {
       }
     }
 
-    const user = await User.findById(req.userId).select("coins gems inventory");
-    if (!user) return res.status(404).json({ message: "User not found." });
+    const { data: profile, error: pErr } = await supabase
+      .from("profiles")
+      .select("coins, gems")
+      .eq("id", req.userId)
+      .single();
+    if (pErr || !profile) return res.status(404).json({ message: "User not found." });
 
     const itemIds = purchaseItems.map((pi) => pi.id);
 
-    // Validate items exist and are in the store
-    const dbItems = await Item.find({ _id: { $in: itemIds }, storeType: "normal" }).lean();
-    const dbItemIds = new Set(dbItems.map((i) => String(i._id)));
-    const missingItems = itemIds.filter((id) => !dbItemIds.has(String(id)));
-    if (missingItems.length > 0) {
+    const { data: dbItems, error: iErr } = await supabase
+      .from("items")
+      .select("id, name, coin_price, gem_price, store_type")
+      .in("id", itemIds)
+      .eq("store_type", "normal");
+    if (iErr) throw iErr;
+
+    const dbItemIds = new Set((dbItems || []).map((i) => i.id));
+    const missing   = itemIds.filter((id) => !dbItemIds.has(id));
+    if (missing.length > 0) {
       return res.status(400).json({ message: "One or more items are not available in the store." });
     }
 
-    // Calculate per-currency totals using item prices
-    const itemMap = new Map(dbItems.map((i) => [String(i._id), i]));
+    const itemMap = new Map((dbItems || []).map((i) => [i.id, i]));
     let totalCoins = 0;
     let totalGems  = 0;
 
     for (const pi of purchaseItems) {
-      const item = itemMap.get(String(pi.id));
+      const item = itemMap.get(pi.id);
       if (!item) continue;
       if (pi.currency === "coins") {
-        if (item.coinPrice === null || item.coinPrice === undefined) {
+        if (item.coin_price === null || item.coin_price === undefined) {
           return res.status(400).json({ message: `"${item.name}" has no coin price.` });
         }
-        totalCoins += item.coinPrice;
+        totalCoins += item.coin_price;
       } else {
-        if (item.gemPrice === null || item.gemPrice === undefined) {
+        if (item.gem_price === null || item.gem_price === undefined) {
           return res.status(400).json({ message: `"${item.name}" has no gem price.` });
         }
-        totalGems += item.gemPrice;
+        totalGems += item.gem_price;
       }
     }
 
-    if (user.coins < totalCoins) {
-      return res.status(400).json({ message: `Not enough coins. Need ${totalCoins}, have ${user.coins}.` });
+    if (profile.coins < totalCoins) {
+      return res.status(400).json({ message: `Not enough coins. Need ${totalCoins}, have ${profile.coins}.` });
     }
-    if (user.gems < totalGems) {
-      return res.status(400).json({ message: `Not enough gems. Need ${totalGems}, have ${user.gems}.` });
+    if (profile.gems < totalGems) {
+      return res.status(400).json({ message: `Not enough gems. Need ${totalGems}, have ${profile.gems}.` });
     }
 
-    // Deduct and add to inventory (one entry per purchase, recording currency and amount)
-    const inventoryEntries = purchaseItems.map(pi => {
-      const item = itemMap.get(String(pi.id));
+    // Deduct currency
+    const currencyUpdate = {};
+    if (totalCoins > 0) currencyUpdate.coins = profile.coins - totalCoins;
+    if (totalGems  > 0) currencyUpdate.gems  = profile.gems  - totalGems;
+
+    // Insert inventory entries
+    const inventoryInserts = purchaseItems.map((pi) => {
+      const item = itemMap.get(pi.id);
       return {
-        itemId:     pi.id,
-        currency:   pi.currency,
-        amountPaid: pi.currency === "coins" ? item.coinPrice : item.gemPrice,
+        user_id:     req.userId,
+        item_id:     pi.id,
+        currency:    pi.currency,
+        amount_paid: pi.currency === "coins" ? item.coin_price : item.gem_price,
       };
     });
-    const updateOp = { $push: { inventory: { $each: inventoryEntries } } };
-    if (totalCoins > 0 || totalGems > 0) {
-      updateOp.$inc = {};
-      if (totalCoins > 0) updateOp.$inc.coins = -totalCoins;
-      if (totalGems  > 0) updateOp.$inc.gems  = -totalGems;
-    }
 
-    const updated = await User.findByIdAndUpdate(req.userId, updateOp, { new: true })
-      .select("coins gems inventory")
-      .lean();
+    await Promise.all([
+      Object.keys(currencyUpdate).length
+        ? supabase.from("profiles").update(currencyUpdate).eq("id", req.userId)
+        : Promise.resolve(),
+      supabase.from("inventory").insert(inventoryInserts),
+    ]);
+
+    const { data: updated } = await supabase
+      .from("profiles")
+      .select("coins, gems")
+      .eq("id", req.userId)
+      .single();
 
     res.json({ success: true, coins: updated.coins, gems: updated.gems, purchasedIds: itemIds });
   } catch (err) {

@@ -1,5 +1,5 @@
 const express = require("express");
-const User = require("../models/User");
+const supabase = require("../lib/supabase");
 
 const router = express.Router();
 
@@ -19,14 +19,18 @@ function extractOutfit(customization) {
   return outfit;
 }
 
-// GET /api/users/appearance/:name — public appearance data (gender + outfit) by player name
+// GET /api/users/appearance/:name — public appearance data by player name
 router.get("/appearance/:name", async (req, res) => {
   try {
-    const user = await User.findOne(
-      { name: req.params.name },
-      "gender customization",
-    ).lean();
+    const { data: user, error } = await supabase
+      .from("profiles")
+      .select("gender, customization")
+      .ilike("name", req.params.name)
+      .maybeSingle();
+
+    if (error) throw error;
     if (!user) return res.status(404).json({ message: "User not found." });
+
     res.json({ gender: user.gender, outfit: extractOutfit(user.customization) });
   } catch (err) {
     console.error("Appearance lookup error:", err);

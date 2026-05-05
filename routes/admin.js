@@ -2,12 +2,10 @@ const express = require("express");
 const multer = require("multer");
 const sharp = require("sharp");
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const { v4: uuidv4 } = require("uuid");
 const requireAdmin = require("../middleware/admin");
-const User = require("../models/User");
-const Item = require("../models/Item");
-const Mail = require("../models/Mail");
-const Submission = require("../models/Submission");
-const { CATEGORY_SUBCATEGORIES } = require("../models/Item");
+const supabase = require("../lib/supabase");
+const { CATEGORY_SUBCATEGORIES } = require("../lib/categories");
 const online = require("../lib/online");
 
 const router = express.Router();
@@ -22,56 +20,70 @@ const s3 = new S3Client({
 });
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
-
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function isPng(buf) { return buf.length >= 8 && buf.subarray(0, 8).equals(PNG_MAGIC); }
-function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+const S3_BASE = () => `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
 
 async function createItemsFromSubmission(submission) {
-  const base = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
-  const tasks = submission.variants.map((variant) =>
-    new Item({
-      name: submission.name,
-      gender: submission.gender,
-      category: submission.category,
-      subcategory: submission.subcategory,
-      imageUrl: variant.imageUrl,
-      thumbnailUrl: variant.thumbnailUrl || "",
-      uploadedBy: submission.uploadedBy,
-    }).save()
-  );
-  return Promise.all(tasks);
+  const inserts = (submission.variants || []).map((variant) => ({
+    id:            uuidv4(),
+    name:          submission.name,
+    gender:        submission.gender,
+    category:      submission.category,
+    subcategory:   submission.subcategory,
+    image_url:     variant.imageUrl,
+    thumbnail_url: variant.thumbnailUrl || "",
+    uploaded_by:   submission.uploaded_by,
+  }));
+  if (inserts.length) {
+    const { error } = await supabase.from("items").insert(inserts);
+    if (error) throw error;
+  }
 }
 
-// ── Stats ──────────────────────────────────────────────────────────────────
+// ── Stats ──────────────────────────────────────────────────
 router.get("/stats", async (req, res) => {
   try {
-    const now = new Date();
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const startOfWeek  = new Date(now); startOfWeek.setDate(now.getDate() - 7);
-    const startOf30d   = new Date(now); startOf30d.setDate(now.getDate() - 30);
+    const now         = new Date();
+    const startToday  = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    const startWeek   = new Date(now.getTime() - 7 * 864e5).toISOString();
+    const start30d    = new Date(now.getTime() - 30 * 864e5).toISOString();
 
-    const [totalUsers, newToday, newThisWeek, totalItems, totalMail, regAgg] = await Promise.all([
-      User.countDocuments(),
-      User.countDocuments({ createdAt: { $gte: startOfToday } }),
-      User.countDocuments({ createdAt: { $gte: startOfWeek } }),
-      Item.countDocuments(),
-      Mail.countDocuments(),
-      User.aggregate([
-        { $match: { createdAt: { $gte: startOf30d } } },
-        { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }, count: { $sum: 1 } } },
-        { $sort: { _id: 1 } },
-      ]),
+    const [
+      { count: totalUsers },
+      { count: newToday },
+      { count: newThisWeek },
+      { count: totalItems },
+      { count: totalMail },
+      { data: regs30d },
+    ] = await Promise.all([
+      supabase.from("profiles").select("*", { count: "exact", head: true }),
+      supabase.from("profiles").select("*", { count: "exact", head: true }).gte("created_at", startToday),
+      supabase.from("profiles").select("*", { count: "exact", head: true }).gte("created_at", startWeek),
+      supabase.from("items").select("*", { count: "exact", head: true }),
+      supabase.from("mail").select("*", { count: "exact", head: true }),
+      supabase.from("profiles").select("created_at").gte("created_at", start30d),
     ]);
 
+    // Group by day in JS
+    const byDay = {};
+    for (const { created_at } of regs30d || []) {
+      const date = created_at.slice(0, 10);
+      byDay[date] = (byDay[date] || 0) + 1;
+    }
+    const registrationsByDay = Object.entries(byDay)
+      .map(([date, count]) => ({ date, count }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
     res.json({
-      totalUsers,
-      onlineUsers: online.onlineUserIds().length,
-      newToday,
-      newThisWeek,
-      totalItems,
-      totalMail,
-      registrationsByDay: regAgg.map((r) => ({ date: r._id, count: r.count })),
+      totalUsers:   totalUsers || 0,
+      onlineUsers:  online.onlineUserIds().length,
+      newToday:     newToday  || 0,
+      newThisWeek:  newThisWeek || 0,
+      totalItems:   totalItems || 0,
+      totalMail:    totalMail  || 0,
+      registrationsByDay,
     });
   } catch (err) {
     console.error("Admin stats error:", err);
@@ -79,41 +91,36 @@ router.get("/stats", async (req, res) => {
   }
 });
 
-// ── Players ────────────────────────────────────────────────────────────────
+// ── Players ────────────────────────────────────────────────
 router.get("/players", async (req, res) => {
   try {
     const page   = Math.max(1, parseInt(req.query.page)  || 1);
     const limit  = Math.min(100, parseInt(req.query.limit) || 20);
     const search = (req.query.search || "").trim();
 
-    const filter = {};
+    let query = supabase
+      .from("profiles")
+      .select("id, name, email, gender, role, roles, is_banned, is_guest, coins, gems, created_at, selected_badge", { count: "exact" })
+      .order("created_at", { ascending: false })
+      .range((page - 1) * limit, page * limit - 1);
+
     if (search) {
-      const re = escapeRegex(search);
-      filter.$or = [
-        { name:  { $regex: re, $options: "i" } },
-        { email: { $regex: re, $options: "i" } },
-      ];
+      query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%`);
     }
 
-    const [players, total] = await Promise.all([
-      User.find(filter)
-        .select("name email gender role roles isBanned isGuest coins gems createdAt selectedBadge")
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean(),
-      User.countDocuments(filter),
-    ]);
+    const { data: players, count: total, error } = await query;
+    if (error) throw error;
 
     const onlineSet = new Set(online.onlineUserIds());
     res.json({
-      players: players.map((p) => ({
+      players: (players || []).map((p) => ({
         ...p,
-        id: String(p._id),
-        roles: [...new Set([p.role, ...(p.roles || [])])],
-        isOnline: onlineSet.has(String(p._id)),
+        roles:    [...new Set([p.role, ...(p.roles || [])])],
+        isOnline: onlineSet.has(p.id),
       })),
-      total, page, limit,
+      total: total || 0,
+      page,
+      limit,
     });
   } catch (err) {
     console.error("Admin players error:", err);
@@ -123,14 +130,19 @@ router.get("/players", async (req, res) => {
 
 router.get("/players/:id", async (req, res) => {
   try {
-    const user = await User.findById(req.params.id).select("-password").lean();
-    if (!user) return res.status(404).json({ message: "User not found." });
-    res.json({ player: {
-      ...user,
-      id: String(user._id),
-      roles: [...new Set([user.role, ...(user.roles || [])])],
-      isOnline: online.isOnline(user._id),
-    }});
+    const { data: player, error } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+    if (error || !player) return res.status(404).json({ message: "User not found." });
+    res.json({
+      player: {
+        ...player,
+        roles:    [...new Set([player.role, ...(player.roles || [])])],
+        isOnline: online.isOnline(player.id),
+      },
+    });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
@@ -147,22 +159,22 @@ router.patch("/players/:id", async (req, res) => {
       if (!Array.isArray(roles) || !roles.every((r) => VALID_ROLES.includes(r))) {
         return res.status(400).json({ message: `Invalid roles. Allowed: ${VALID_ROLES.join(", ")}` });
       }
-      // Keep primary role as the "highest" privilege
-      update.role  = roles.includes("admin") ? "admin" : roles.includes("player") ? "player" : "player";
+      update.role  = roles.includes("admin") ? "admin" : "player";
       update.roles = roles.filter((r) => r !== update.role);
     }
-    if (isBanned !== undefined) update.isBanned = Boolean(isBanned);
-    if (coins    !== undefined) update.coins    = Number(coins);
-    if (gems     !== undefined) update.gems     = Number(gems);
-    if (name     !== undefined) update.name     = String(name).trim().slice(0, 40);
+    if (isBanned !== undefined) update.is_banned = Boolean(isBanned);
+    if (coins    !== undefined) update.coins     = Number(coins);
+    if (gems     !== undefined) update.gems      = Number(gems);
+    if (name     !== undefined) update.name      = String(name).trim().slice(0, 40);
 
-    const user = await User.findByIdAndUpdate(req.params.id, update, { new: true }).select("-password").lean();
-    if (!user) return res.status(404).json({ message: "User not found." });
-    res.json({ player: {
-      ...user,
-      id: String(user._id),
-      roles: [...new Set([user.role, ...(user.roles || [])])],
-    }});
+    const { data: player, error } = await supabase
+      .from("profiles")
+      .update(update)
+      .eq("id", req.params.id)
+      .select("*")
+      .single();
+    if (error || !player) return res.status(404).json({ message: "User not found." });
+    res.json({ player: { ...player, roles: [...new Set([player.role, ...(player.roles || [])])] } });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
@@ -170,18 +182,19 @@ router.patch("/players/:id", async (req, res) => {
 
 router.delete("/players/:id", async (req, res) => {
   try {
-    if (String(req.params.id) === String(req.userId)) {
+    if (req.params.id === req.userId) {
       return res.status(400).json({ message: "Cannot delete your own account." });
     }
-    const user = await User.findByIdAndDelete(req.params.id);
-    if (!user) return res.status(404).json({ message: "User not found." });
+    // Delete from Supabase Auth (also cascades profile via FK)
+    const { error } = await supabase.auth.admin.deleteUser(req.params.id);
+    if (error) return res.status(404).json({ message: "User not found." });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
 });
 
-// ── Items ──────────────────────────────────────────────────────────────────
+// ── Items ──────────────────────────────────────────────────
 router.get("/items", async (req, res) => {
   try {
     const page     = Math.max(1, parseInt(req.query.page)  || 1);
@@ -189,60 +202,50 @@ router.get("/items", async (req, res) => {
     const search   = (req.query.search   || "").trim();
     const category = (req.query.category || "").trim();
 
-    const matchFilter = {};
-    if (search) matchFilter.name = { $regex: escapeRegex(search), $options: "i" };
-    if (category && CATEGORY_SUBCATEGORIES[category]) matchFilter.category = category;
+    let query = supabase.from("items").select("*, profiles!uploaded_by(name, email)").order("created_at", { ascending: false });
 
-    const pipeline = [
-      { $match: matchFilter },
-      { $sort: { createdAt: -1 } },
-      {
-        $group: {
-          _id: { name: "$name", category: "$category" },
-          name:             { $first: "$name" },
-          category:         { $first: "$category" },
-          subcategory:      { $first: "$subcategory" },
-          rarity:           { $first: "$rarity" },
-          storeType:        { $first: "$storeType" },
-          levelRequirement: { $first: "$levelRequirement" },
-          notes:            { $first: "$notes" },
-          coinPrice:        { $first: "$coinPrice" },
-          gemPrice:         { $first: "$gemPrice" },
-          uploadedById:     { $first: "$uploadedBy" },
-          firstCreatedAt:   { $first: "$createdAt" },
-          variants: { $push: {
-            _id: "$_id", subcategory: "$subcategory", gender: "$gender",
-            imageUrl: "$imageUrl", thumbnailUrl: "$thumbnailUrl", createdAt: "$createdAt",
-          }},
-        },
-      },
-      { $sort: { firstCreatedAt: -1 } },
-      { $lookup: { from: "users", localField: "uploadedById", foreignField: "_id", as: "uploadedByArr" } },
-      {
-        $facet: {
-          groups:     [{ $skip: (page - 1) * limit }, { $limit: limit }],
-          totalCount: [{ $count: "count" }],
-        },
-      },
-    ];
+    if (search) query = query.ilike("name", `%${search}%`);
+    if (category && CATEGORY_SUBCATEGORIES[category]) query = query.eq("category", category);
 
-    const [result] = await Item.aggregate(pipeline);
-    const groups = (result?.groups || []).map((g) => ({
-      name:             g.name,
-      category:         g.category,
-      subcategory:      g.subcategory,
-      rarity:           g.rarity || null,
-      storeType:        g.storeType || null,
-      levelRequirement: g.levelRequirement ?? null,
-      notes:            g.notes || "",
-      coinPrice:        g.coinPrice ?? null,
-      gemPrice:         g.gemPrice ?? null,
-      uploadedBy:       g.uploadedByArr?.[0] ? { name: g.uploadedByArr[0].name, email: g.uploadedByArr[0].email } : null,
-      createdAt:        g.firstCreatedAt,
-      variants:         g.variants.map((v) => ({ ...v, id: String(v._id) })),
-    }));
+    const { data: allItems, error } = await query;
+    if (error) throw error;
 
-    const total = result?.totalCount?.[0]?.count || 0;
+    // Group by name + category (JavaScript-side)
+    const groupMap = new Map();
+    for (const item of allItems || []) {
+      const key = `${item.name}||${item.category}`;
+      if (!groupMap.has(key)) {
+        groupMap.set(key, {
+          name:             item.name,
+          category:         item.category,
+          subcategory:      item.subcategory,
+          rarity:           item.rarity || null,
+          storeType:        item.store_type || null,
+          levelRequirement: item.level_requirement ?? null,
+          notes:            item.notes || "",
+          coinPrice:        item.coin_price ?? null,
+          gemPrice:         item.gem_price ?? null,
+          uploadedBy:       item.profiles ? { name: item.profiles.name, email: item.profiles.email } : null,
+          createdAt:        item.created_at,
+          variants:         [],
+        });
+      }
+      groupMap.get(key).variants.push({
+        id:          item.id,
+        subcategory: item.subcategory,
+        gender:      item.gender,
+        imageUrl:    item.image_url,
+        thumbnailUrl: item.thumbnail_url,
+        createdAt:   item.created_at,
+      });
+    }
+
+    const sorted = Array.from(groupMap.values()).sort(
+      (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+    );
+    const total  = sorted.length;
+    const groups = sorted.slice((page - 1) * limit, page * limit);
+
     res.json({ groups, total, page, limit });
   } catch (err) {
     console.error("Admin items error:", err);
@@ -260,7 +263,7 @@ router.post("/items", upload.single("image"), async (req, res) => {
     if (!req.file) return res.status(400).json({ message: "Image required." });
     if (!isPng(req.file.buffer)) return res.status(400).json({ message: "Image must be a valid PNG." });
 
-    const item = new Item({ name: name.trim(), category, subcategory, imageUrl: "", uploadedBy: req.userId });
+    const itemId = uuidv4();
 
     const thumbnailBuffer = await sharp(req.file.buffer)
       .extract({ left: 0, top: 4616, width: 510, height: 510 })
@@ -268,41 +271,57 @@ router.post("/items", upload.single("image"), async (req, res) => {
       .png()
       .toBuffer();
 
-    const key          = `items/${item._id}.png`;
-    const thumbnailKey = `item-thumbnails/${item._id}.png`;
+    const key          = `items/${itemId}.png`;
+    const thumbnailKey = `item-thumbnails/${itemId}.png`;
+    const base         = S3_BASE();
+
     await Promise.all([
       s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: key, Body: req.file.buffer, ContentType: "image/png" })),
       s3.send(new PutObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: thumbnailKey, Body: thumbnailBuffer, ContentType: "image/png" })),
     ]);
 
-    const base = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`;
-    item.imageUrl     = `${base}/${key}`;
-    item.thumbnailUrl = `${base}/${thumbnailKey}`;
-    await item.save();
-    res.status(201).json({ item: { id: item._id, name: item.name, category: item.category, subcategory: item.subcategory, imageUrl: item.imageUrl, thumbnailUrl: item.thumbnailUrl } });
+    const { data: item, error } = await supabase
+      .from("items")
+      .insert({
+        id:            itemId,
+        name:          name.trim(),
+        category,
+        subcategory,
+        image_url:     `${base}/${key}`,
+        thumbnail_url: `${base}/${thumbnailKey}`,
+        uploaded_by:   req.userId,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+
+    res.status(201).json({
+      item: { id: item.id, name: item.name, category: item.category, subcategory: item.subcategory, imageUrl: item.image_url, thumbnailUrl: item.thumbnail_url },
+    });
   } catch (err) {
     console.error("Admin item create error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
 
-// ── Group-level update (must be before /:id) ──────────────────────────────
+// Group-level update
 router.patch("/items/group", async (req, res) => {
   try {
     const { name, category, newName, rarity, storeType, levelRequirement, notes, coinPrice, gemPrice } = req.body;
     if (!name || !category) return res.status(400).json({ message: "name and category are required." });
 
     const update = {};
-    if (newName !== undefined) update.name = String(newName).trim().slice(0, 40);
-    if (rarity !== undefined) update.rarity = rarity || null;
-    if (storeType !== undefined) update.storeType = storeType || null;
-    if (levelRequirement !== undefined) update.levelRequirement = levelRequirement !== null && levelRequirement !== "" ? Number(levelRequirement) : null;
-    if (notes !== undefined) update.notes = String(notes).slice(0, 500);
-    if (coinPrice !== undefined) update.coinPrice = coinPrice !== null && coinPrice !== "" ? Number(coinPrice) : null;
-    if (gemPrice !== undefined) update.gemPrice = gemPrice !== null && gemPrice !== "" ? Number(gemPrice) : null;
+    if (newName          !== undefined) update.name              = String(newName).trim().slice(0, 40);
+    if (rarity           !== undefined) update.rarity            = rarity || null;
+    if (storeType        !== undefined) update.store_type        = storeType || null;
+    if (levelRequirement !== undefined) update.level_requirement = (levelRequirement !== null && levelRequirement !== "") ? Number(levelRequirement) : null;
+    if (notes            !== undefined) update.notes             = String(notes).slice(0, 500);
+    if (coinPrice        !== undefined) update.coin_price        = (coinPrice !== null && coinPrice !== "") ? Number(coinPrice) : null;
+    if (gemPrice         !== undefined) update.gem_price         = (gemPrice  !== null && gemPrice  !== "") ? Number(gemPrice)  : null;
 
-    const result = await Item.updateMany({ name, category }, update);
-    res.json({ success: true, modifiedCount: result.modifiedCount });
+    const { error } = await supabase.from("items").update(update).eq("name", name).eq("category", category);
+    if (error) throw error;
+    res.json({ success: true });
   } catch (err) {
     console.error("Admin group update error:", err);
     res.status(500).json({ message: "Server error." });
@@ -313,47 +332,57 @@ router.patch("/items/:id", async (req, res) => {
   try {
     const { name, category, subcategory, gender, storeType, rarity, notes, levelRequirement, coinPrice, gemPrice } = req.body;
     const update = {};
-    if (name !== undefined) update.name = String(name).trim().slice(0, 40);
-    if (category !== undefined) {
+
+    if (name            !== undefined) update.name              = String(name).trim().slice(0, 40);
+    if (category        !== undefined) {
       if (!CATEGORY_SUBCATEGORIES[category]) return res.status(400).json({ message: "Invalid category." });
       update.category = category;
     }
-    if (subcategory !== undefined) update.subcategory = subcategory;
-    if (gender !== undefined) update.gender = gender || undefined;
-    if (storeType !== undefined) {
+    if (subcategory     !== undefined) update.subcategory       = subcategory;
+    if (gender          !== undefined) update.gender            = gender || null;
+    if (storeType       !== undefined) {
       if (storeType !== null && !["normal"].includes(storeType)) {
         return res.status(400).json({ message: "Invalid storeType." });
       }
-      update.storeType = storeType || null;
+      update.store_type = storeType || null;
     }
-    if (rarity !== undefined) update.rarity = rarity || null;
-    if (notes !== undefined) update.notes = String(notes).slice(0, 500);
-    if (levelRequirement !== undefined) update.levelRequirement = levelRequirement ? Number(levelRequirement) : null;
-    if (coinPrice !== undefined) update.coinPrice = coinPrice !== null && coinPrice !== "" ? Number(coinPrice) : null;
-    if (gemPrice !== undefined) update.gemPrice = gemPrice !== null && gemPrice !== "" ? Number(gemPrice) : null;
+    if (rarity          !== undefined) update.rarity            = rarity || null;
+    if (notes           !== undefined) update.notes             = String(notes).slice(0, 500);
+    if (levelRequirement !== undefined) update.level_requirement = levelRequirement ? Number(levelRequirement) : null;
+    if (coinPrice       !== undefined) update.coin_price        = (coinPrice !== null && coinPrice !== "") ? Number(coinPrice) : null;
+    if (gemPrice        !== undefined) update.gem_price         = (gemPrice  !== null && gemPrice  !== "") ? Number(gemPrice)  : null;
 
-    const item = await Item.findByIdAndUpdate(req.params.id, update, { new: true }).lean();
-    if (!item) return res.status(404).json({ message: "Item not found." });
-    res.json({ item: { ...item, id: String(item._id) } });
+    const { data: item, error } = await supabase
+      .from("items")
+      .update(update)
+      .eq("id", req.params.id)
+      .select()
+      .single();
+    if (error || !item) return res.status(404).json({ message: "Item not found." });
+    res.json({ item: { ...item, id: item.id, imageUrl: item.image_url, thumbnailUrl: item.thumbnail_url } });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
 });
 
-// ── Group-level delete (must be before /:id) ───────────────────────────────
+// Group-level delete
 router.delete("/items/group", async (req, res) => {
   try {
     const { name, category } = req.query;
     if (!name || !category) return res.status(400).json({ message: "name and category are required." });
 
-    const items = await Item.find({ name, category }).lean();
-    await Promise.allSettled(items.flatMap((item) => [
-      s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `items/${item._id}.png` })),
-      s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `item-thumbnails/${item._id}.png` })),
-    ]));
+    const { data: items } = await supabase.from("items").select("id").eq("name", name).eq("category", category);
 
-    const result = await Item.deleteMany({ name, category });
-    res.json({ success: true, deletedCount: result.deletedCount });
+    await Promise.allSettled(
+      (items || []).flatMap((item) => [
+        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `items/${item.id}.png` })),
+        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `item-thumbnails/${item.id}.png` })),
+      ])
+    );
+
+    const { error } = await supabase.from("items").delete().eq("name", name).eq("category", category);
+    if (error) throw error;
+    res.json({ success: true, deletedCount: (items || []).length });
   } catch (err) {
     console.error("Admin group delete error:", err);
     res.status(500).json({ message: "Server error." });
@@ -362,12 +391,17 @@ router.delete("/items/group", async (req, res) => {
 
 router.delete("/items/:id", async (req, res) => {
   try {
-    const item = await Item.findByIdAndDelete(req.params.id).lean();
-    if (!item) return res.status(404).json({ message: "Item not found." });
+    const { data: item, error } = await supabase
+      .from("items")
+      .delete()
+      .eq("id", req.params.id)
+      .select("id")
+      .single();
+    if (error || !item) return res.status(404).json({ message: "Item not found." });
     try {
       await Promise.all([
-        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `items/${item._id}.png` })),
-        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `item-thumbnails/${item._id}.png` })),
+        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `items/${item.id}.png` })),
+        s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET, Key: `item-thumbnails/${item.id}.png` })),
       ]);
     } catch { /* best-effort */ }
     res.json({ success: true });
@@ -376,52 +410,49 @@ router.delete("/items/:id", async (req, res) => {
   }
 });
 
-// ── Submissions ────────────────────────────────────────────────────────────
+// ── Submissions ────────────────────────────────────────────
 router.get("/submissions", async (req, res) => {
   try {
     const page   = Math.max(1, parseInt(req.query.page)  || 1);
     const limit  = Math.min(100, parseInt(req.query.limit) || 20);
     const status = (req.query.status || "").trim();
 
-    const filter = {};
-    if (["pending", "approved", "declined"].includes(status)) filter.status = status;
+    let query = supabase
+      .from("submissions")
+      .select("*, profiles!uploaded_by(name, email)")
+      .order("created_at", { ascending: false });
+    if (["pending", "approved", "declined"].includes(status)) query = query.eq("status", status);
 
-    // Fetch non-set submissions and the "first" of each set group
-    const allSubs = await Submission.find(filter)
-      .populate("uploadedBy", "name email")
-      .sort({ createdAt: -1 })
-      .lean();
+    const { data: allSubs, error } = await query;
+    if (error) throw error;
 
-    // Group sets by setCode, keep singles as-is
-    const seen = new Set();
+    const seen    = new Set();
     const grouped = [];
-    for (const sub of allSubs) {
-      if (!sub.isSet) {
-        grouped.push({ ...sub, id: String(sub._id) });
+    for (const sub of allSubs || []) {
+      if (!sub.is_set) {
+        grouped.push({ ...sub, id: sub.id, uploadedBy: sub.profiles || null });
       } else {
-        if (!seen.has(sub.setCode)) {
-          seen.add(sub.setCode);
-          // Collect all items of this set (already in allSubs)
-          const setItems = allSubs
-            .filter((s) => s.setCode === sub.setCode)
-            .sort((a, b) => (a.setPosition ?? 0) - (b.setPosition ?? 0))
-            .map((s) => ({ ...s, id: String(s._id) }));
+        if (!seen.has(sub.set_code)) {
+          seen.add(sub.set_code);
+          const setItems = (allSubs || [])
+            .filter((s) => s.set_code === sub.set_code)
+            .sort((a, b) => (a.set_position ?? 0) - (b.set_position ?? 0))
+            .map((s) => ({ ...s, id: s.id }));
           grouped.push({
-            isSet: true,
-            setCode: sub.setCode,
-            status: sub.status,
-            uploadedBy: sub.uploadedBy,
-            createdAt: sub.createdAt,
-            adminNote: sub.adminNote,
-            items: setItems,
+            isSet:      true,
+            setCode:    sub.set_code,
+            status:     sub.status,
+            uploadedBy: sub.profiles || null,
+            createdAt:  sub.created_at,
+            adminNote:  sub.admin_note,
+            items:      setItems,
           });
         }
       }
     }
 
-    const total = grouped.length;
+    const total     = grouped.length;
     const paginated = grouped.slice((page - 1) * limit, page * limit);
-
     res.json({ submissions: paginated, total, page, limit });
   } catch (err) {
     console.error("Admin submissions error:", err);
@@ -429,43 +460,49 @@ router.get("/submissions", async (req, res) => {
   }
 });
 
-// Approve/decline a single submission
 router.patch("/submissions/:id/status", async (req, res) => {
   try {
     const { status, adminNote } = req.body;
     if (!["approved", "declined"].includes(status)) {
       return res.status(400).json({ message: "Status must be 'approved' or 'declined'." });
     }
+
     const update = { status };
-    if (adminNote !== undefined) update.adminNote = String(adminNote).slice(0, 500);
+    if (adminNote !== undefined) update.admin_note = String(adminNote).slice(0, 500);
 
-    const submission = await Submission.findByIdAndUpdate(req.params.id, update, { new: true }).lean();
-    if (!submission) return res.status(404).json({ message: "Submission not found." });
+    const { data: submission, error } = await supabase
+      .from("submissions")
+      .update(update)
+      .eq("id", req.params.id)
+      .select()
+      .single();
+    if (error || !submission) return res.status(404).json({ message: "Submission not found." });
 
-    if (status === "approved") {
-      await createItemsFromSubmission(submission);
-    }
+    if (status === "approved") await createItemsFromSubmission(submission);
 
-    res.json({ submission: { ...submission, id: String(submission._id) } });
+    res.json({ submission: { ...submission, id: submission.id } });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
 });
 
-// Approve/decline all items in a set at once
 router.patch("/submissions/set/:setCode/status", async (req, res) => {
   try {
     const { status, adminNote } = req.body;
     if (!["approved", "declined"].includes(status)) {
       return res.status(400).json({ message: "Status must be 'approved' or 'declined'." });
     }
+
+    const { data: submissions, error: fetchErr } = await supabase
+      .from("submissions")
+      .select("*")
+      .eq("set_code", req.params.setCode);
+    if (fetchErr || !submissions?.length) return res.status(404).json({ message: "Set not found." });
+
     const update = { status };
-    if (adminNote !== undefined) update.adminNote = String(adminNote).slice(0, 500);
+    if (adminNote !== undefined) update.admin_note = String(adminNote).slice(0, 500);
 
-    const submissions = await Submission.find({ setCode: req.params.setCode }).lean();
-    if (!submissions.length) return res.status(404).json({ message: "Set not found." });
-
-    await Submission.updateMany({ setCode: req.params.setCode }, update);
+    await supabase.from("submissions").update(update).eq("set_code", req.params.setCode);
 
     if (status === "approved") {
       await Promise.all(submissions.map(createItemsFromSubmission));
@@ -477,7 +514,7 @@ router.patch("/submissions/set/:setCode/status", async (req, res) => {
   }
 });
 
-// ── Online ─────────────────────────────────────────────────────────────────
+// ── Online ─────────────────────────────────────────────────
 router.get("/online", (req, res) => {
   const players = req.app.locals.players;
   if (!players) return res.json({ players: [], total: 0 });
@@ -492,24 +529,20 @@ router.get("/online", (req, res) => {
   res.json({ players: list, total: list.length });
 });
 
-// ── Mail ───────────────────────────────────────────────────────────────────
+// ── Mail ───────────────────────────────────────────────────
 router.get("/mail", async (req, res) => {
   try {
     const page  = Math.max(1, parseInt(req.query.page)  || 1);
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
 
-    const [mail, total] = await Promise.all([
-      Mail.find()
-        .populate("from", "name email")
-        .populate("to",   "name email")
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean(),
-      Mail.countDocuments(),
-    ]);
+    const { data: mail, count: total, error } = await supabase
+      .from("mail")
+      .select("*, sender:profiles!from_id(name, email), recipient:profiles!to_id(name, email)", { count: "exact" })
+      .order("created_at", { ascending: false })
+      .range((page - 1) * limit, page * limit - 1);
+    if (error) throw error;
 
-    res.json({ mail: mail.map((m) => ({ ...m, id: String(m._id) })), total, page, limit });
+    res.json({ mail: (mail || []).map((m) => ({ ...m, id: m.id })), total: total || 0, page, limit });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
@@ -517,7 +550,7 @@ router.get("/mail", async (req, res) => {
 
 router.delete("/mail/:id", async (req, res) => {
   try {
-    await Mail.findByIdAndDelete(req.params.id);
+    await supabase.from("mail").delete().eq("id", req.params.id);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Server error." });

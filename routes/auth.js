@@ -1,14 +1,10 @@
 const express = require("express");
-const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
-const { OAuth2Client } = require("google-auth-library");
 const { v4: uuidv4 } = require("uuid");
-const User = require("../models/User");
+const supabase = require("../lib/supabase");
 const auth = require("../middleware/auth");
 
 const router = express.Router();
-
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -34,162 +30,185 @@ const guestLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-function signToken(user) {
-  return jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-    expiresIn: "7d",
-  });
+// email is read-only — synced from auth.users by the DB trigger
+function toPublic(profile) {
+  const roles = [...new Set([profile.role || "player", ...(profile.roles || [])])];
+  const needsSetup = !profile.is_guest && !profile.name;
+  return {
+    id:           profile.id,
+    name:         profile.name || "",
+    email:        profile.email,
+    gender:       profile.gender,
+    avatar:       profile.avatar || "",
+    bio:          profile.bio || "",
+    selectedBadge: profile.selected_badge || null,
+    isGuest:      profile.is_guest || false,
+    isBanned:     profile.is_banned || false,
+    role:         profile.role || "player",
+    roles,
+    level:        profile.level || 1,
+    coins:        profile.coins || 0,
+    gems:         profile.gems || 0,
+    customization: profile.customization || {},
+    ...(needsSetup ? { needsSetup: true } : {}),
+  };
 }
 
-// ── Register (email + password only, name/gender chosen later via /setup) ──
+// ── Register ──────────────────────────────────────────────
+// Uses Supabase signUp — respects project email-confirmation setting.
+// Profile is created automatically by the DB trigger on auth.users insert.
 router.post("/register", registerLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Email and password are required." });
+      return res.status(400).json({ message: "Email and password are required." });
     }
-
     if (password.length < 6) {
-      return res
-        .status(400)
-        .json({ message: "Password must be at least 6 characters." });
+      return res.status(400).json({ message: "Password must be at least 6 characters." });
     }
 
-    const existing = await User.findOne({ email });
-    if (existing) {
-      return res.status(409).json({ message: "Email already in use." });
+    const { data, error } = await supabase.auth.signUp({
+      email: email.toLowerCase(),
+      password,
+    });
+
+    if (error) {
+      if (error.message?.toLowerCase().includes("already registered")) {
+        return res.status(409).json({ message: "Email already in use." });
+      }
+      throw error;
     }
 
-    const user = await User.create({ email, password });
-    const token = signToken(user);
+    // Email confirmation required — session is null until confirmed
+    if (!data.session) {
+      return res.status(201).json({ message: "Check your email to confirm your account." });
+    }
 
-    res.status(201).json({ user: user.toPublic(), token });
+    // Profile was created by the DB trigger
+    const { data: profile, error: profileError } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", data.user.id)
+      .single();
+    if (profileError || !profile) return res.status(500).json({ message: "Profile creation failed." });
+
+    res.status(201).json({ user: toPublic(profile), token: data.session.access_token });
   } catch (err) {
     console.error("Registration error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
 
-// ── Login ──
+// ── Login ─────────────────────────────────────────────────
 router.post("/login", loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Email and password are required." });
+      return res.status(400).json({ message: "Email and password are required." });
     }
 
-    const user = await User.findOne({ email });
-    if (!user || !user.password) {
-      return res.status(401).json({ message: "Invalid email or password." });
-    }
+    const { data: { session }, error } = await supabase.auth.signInWithPassword({
+      email: email.toLowerCase(),
+      password,
+    });
+    if (error) return res.status(401).json({ message: "Invalid email or password." });
 
-    const match = await user.comparePassword(password);
-    if (!match) {
-      return res.status(401).json({ message: "Invalid email or password." });
-    }
+    const { data: profile, error: profileError } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", session.user.id)
+      .single();
+    if (profileError || !profile) return res.status(404).json({ message: "Profile not found." });
 
-    const token = signToken(user);
-    res.json({ user: user.toPublic(), token });
+    res.json({ user: toPublic(profile), token: session.access_token });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
 });
 
-// ── Guest ──
+// ── Guest ─────────────────────────────────────────────────
+// Uses admin.createUser to bypass email confirmation for disposable accounts.
+// Profile is created by the DB trigger, then updated with guest-specific fields.
 router.post("/guest", guestLimiter, async (req, res) => {
   try {
-    const guestName = `Guest_${uuidv4().slice(0, 6)}`;
-    const user = await User.create({ name: guestName, isGuest: true });
-    const token = signToken(user);
+    const guestEmail    = `guest_${uuidv4()}@guest.fv`;
+    const guestPassword = uuidv4();
+    const guestName     = `Guest_${uuidv4().slice(0, 6)}`;
 
-    res.status(201).json({ user: user.toPublic(), token });
+    const { data: { user }, error: createError } = await supabase.auth.admin.createUser({
+      email: guestEmail,
+      password: guestPassword,
+      email_confirm: true,
+    });
+    if (createError) throw createError;
+
+    // Trigger already inserted the profile row — set guest-specific fields
+    await supabase
+      .from("profiles")
+      .update({ name: guestName, is_guest: true })
+      .eq("id", user.id);
+
+    const { data: { session }, error: signInError } = await supabase.auth.signInWithPassword({
+      email: guestEmail,
+      password: guestPassword,
+    });
+    if (signInError) throw signInError;
+
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", user.id)
+      .single();
+
+    res.status(201).json({ user: toPublic(profile), token: session.access_token });
   } catch (err) {
     console.error("Guest creation error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
 
-// ── Google ──
-router.post("/google", loginLimiter, async (req, res) => {
+// ── Me (used after OAuth redirect to fetch profile) ───────
+router.get("/me", auth, async (req, res) => {
   try {
-    const { credential } = req.body;
-    if (!credential) {
-      return res.status(400).json({ message: "Missing Google credential." });
-    }
-
-    const ticket = await googleClient.verifyIdToken({
-      idToken: credential,
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
-    const payload = ticket.getPayload();
-
-    const { sub: googleId, email, email_verified } = payload;
-    if (!email_verified) {
-      return res.status(401).json({ message: "Google email not verified." });
-    }
-
-    let user = await User.findOne({ googleId });
-
-    if (!user) {
-      // Check if email already exists (link accounts)
-      user = await User.findOne({ email });
-      if (user) {
-        user.googleId = googleId;
-        await user.save();
-      } else {
-        // Create without name/avatar — user picks them in /setup
-        user = await User.create({ email, googleId });
-      }
-    }
-
-    const token = signToken(user);
-    res.json({ user: user.toPublic(), token });
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", req.userId)
+      .single();
+    if (error || !profile) return res.status(404).json({ message: "Profile not found." });
+    res.json({ user: toPublic(profile) });
   } catch (err) {
-    if (err.message?.includes("Token") || err.message?.includes("audience")) {
-      return res.status(401).json({ message: "Invalid Google credential." });
-    }
-    console.error("Google login error:", err);
+    console.error("Me error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
 
-// ── Character Setup (choose name + gender after register / first Google login) ──
+// ── Setup (choose name + gender after first login) ────────
 router.post("/setup", auth, async (req, res) => {
   try {
     const { name, gender } = req.body;
-
-    if (!name || !name.trim()) {
-      return res.status(400).json({ message: "Name is required." });
-    }
-
+    if (!name || !name.trim()) return res.status(400).json({ message: "Name is required." });
     if (gender && !["male", "female"].includes(gender)) {
       return res.status(400).json({ message: "Invalid gender." });
     }
 
-    const user = await User.findById(req.userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found." });
-    }
+    const update = { name: name.trim() };
+    if (gender) update.gender = gender;
 
-    user.name = name.trim();
-    if (gender) user.gender = gender;
-    await user.save();
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .update(update)
+      .eq("id", req.userId)
+      .select()
+      .single();
+    if (error || !profile) return res.status(404).json({ message: "User not found." });
 
-    res.json({ user: user.toPublic() });
+    res.json({ user: toPublic(profile) });
   } catch (err) {
     console.error("Setup error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
-
-function escapeRegex(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 function extractOutfitShallow(customization) {
   const outfit = {};
@@ -207,34 +226,44 @@ function extractOutfitShallow(customization) {
   return outfit;
 }
 
-// ── Lookup a user by exact (case-insensitive) name ──
+// ── Lookup user by name (case-insensitive exact match) ────
 router.get("/user", auth, async (req, res) => {
   try {
     const name = (req.query.name || "").trim();
     if (!name) return res.status(400).json({ message: "Name required." });
-    if (name.length > 100) {
-      return res.status(400).json({ message: "Name too long." });
-    }
+    if (name.length > 100) return res.status(400).json({ message: "Name too long." });
 
-    const user = await User.findOne({
-      name: { $regex: `^${escapeRegex(name)}$`, $options: "i" },
-    })
-      .populate("soulMate", "name")
-      .lean();
+    const { data: user } = await supabase
+      .from("profiles")
+      .select("id, name, gender, bio, selected_badge, customization")
+      .ilike("name", name)
+      .maybeSingle();
 
     if (!user) return res.status(404).json({ message: "User not found." });
 
+    const { data: smRow } = await supabase
+      .from("soulmates")
+      .select("user_id, partner_id")
+      .or(`user_id.eq.${user.id},partner_id.eq.${user.id}`)
+      .eq("status", "accepted")
+      .maybeSingle();
+
+    let soulMate = null;
+    if (smRow) {
+      const smId = smRow.user_id === user.id ? smRow.partner_id : smRow.user_id;
+      const { data: sm } = await supabase.from("profiles").select("id, name").eq("id", smId).single();
+      if (sm) soulMate = { id: sm.id, name: sm.name };
+    }
+
     res.json({
       user: {
-        id: String(user._id),
-        name: user.name,
-        gender: user.gender,
-        bio: user.bio || "",
-        selectedBadge: user.selectedBadge || null,
-        outfit: extractOutfitShallow(user.customization),
-        soulMate: user.soulMate
-          ? { id: String(user.soulMate._id), name: user.soulMate.name }
-          : null,
+        id:           user.id,
+        name:         user.name,
+        gender:       user.gender,
+        bio:          user.bio || "",
+        selectedBadge: user.selected_badge || null,
+        outfit:       extractOutfitShallow(user.customization),
+        soulMate,
       },
     });
   } catch (err) {
@@ -243,40 +272,31 @@ router.get("/user", auth, async (req, res) => {
   }
 });
 
-// ── Update bio ──
+// ── Update bio ────────────────────────────────────────────
 router.patch("/bio", auth, async (req, res) => {
   try {
     const { bio } = req.body;
-    if (typeof bio !== "string") {
-      return res.status(400).json({ message: "Bio must be a string." });
-    }
+    if (typeof bio !== "string") return res.status(400).json({ message: "Bio must be a string." });
     const trimmed = bio.trim();
-    if (trimmed.length > 500) {
-      return res.status(400).json({ message: "Bio must be 500 characters or fewer." });
-    }
+    if (trimmed.length > 500) return res.status(400).json({ message: "Bio must be 500 characters or fewer." });
 
-    const user = await User.findById(req.userId);
-    if (!user) return res.status(404).json({ message: "User not found." });
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .update({ bio: trimmed })
+      .eq("id", req.userId)
+      .select("id, bio")
+      .single();
+    if (error || !profile) return res.status(404).json({ message: "User not found." });
 
-    user.bio = trimmed;
-    await user.save();
-
-    // Update in-memory player records so newly joining clients see the fresh
-    // bio without reloading the full user from DB
     const players = req.app.locals.players;
     if (players) {
       for (const p of players.values()) {
-        if (String(p.userId) === String(user._id)) p.bio = user.bio;
+        if (p.userId === req.userId) p.bio = trimmed;
       }
     }
 
-    // Notify everyone — clients that don't know this user just ignore
-    req.app.locals.io?.emit("player:bio", {
-      userId: String(user._id),
-      bio: user.bio,
-    });
-
-    res.json({ bio: user.bio });
+    req.app.locals.io?.emit("player:bio", { userId: req.userId, bio: trimmed });
+    res.json({ bio: trimmed });
   } catch (err) {
     console.error("Bio update error:", err);
     res.status(500).json({ message: "Server error." });
@@ -285,7 +305,7 @@ router.patch("/bio", auth, async (req, res) => {
 
 const ALLOWED_BADGES = ["diamond", "flame", "medal", "paint", "verified"];
 
-// ── Update selected badge ──
+// ── Update badge ──────────────────────────────────────────
 router.patch("/badge", auth, async (req, res) => {
   try {
     const { badge } = req.body;
@@ -293,26 +313,23 @@ router.patch("/badge", auth, async (req, res) => {
       return res.status(400).json({ message: "Invalid badge." });
     }
 
-    const user = await User.findByIdAndUpdate(
-      req.userId,
-      { $set: { selectedBadge: badge } },
-      { new: true }
-    );
-    if (!user) return res.status(404).json({ message: "User not found." });
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .update({ selected_badge: badge ?? null })
+      .eq("id", req.userId)
+      .select("id, selected_badge")
+      .single();
+    if (error || !profile) return res.status(404).json({ message: "User not found." });
 
     const players = req.app.locals.players;
     if (players) {
       for (const p of players.values()) {
-        if (String(p.userId) === String(user._id)) p.selectedBadge = user.selectedBadge;
+        if (p.userId === req.userId) p.selectedBadge = badge;
       }
     }
 
-    req.app.locals.io?.emit("player:badge", {
-      userId: String(user._id),
-      badge: user.selectedBadge,
-    });
-
-    res.json({ selectedBadge: user.selectedBadge });
+    req.app.locals.io?.emit("player:badge", { userId: req.userId, badge });
+    res.json({ selectedBadge: badge });
   } catch (err) {
     console.error("Badge update error:", err);
     res.status(500).json({ message: "Server error." });

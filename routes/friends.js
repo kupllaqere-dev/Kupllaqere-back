@@ -1,13 +1,13 @@
 const express = require("express");
-const mongoose = require("mongoose");
 const auth = require("../middleware/auth");
-const User = require("../models/User");
+const supabase = require("../lib/supabase");
 const { isOnline } = require("../lib/online");
 
 const router = express.Router();
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function isValidId(id) {
-  return mongoose.Types.ObjectId.isValid(id);
+  return typeof id === "string" && UUID_RE.test(id);
 }
 
 function extractOutfit(customization) {
@@ -26,17 +26,6 @@ function extractOutfit(customization) {
   return outfit;
 }
 
-function publicSummary(user) {
-  return {
-    id: user._id,
-    name: user.name,
-    avatar: user.avatar,
-    online: isOnline(user._id),
-  };
-}
-
-// Push a refresh signal to all of the given users' active sockets so their
-// clients can re-fetch their friends/presence state.
 function notifyFriendsChanged(req, userIds) {
   const io = req.app.locals.io;
   const socketsForUser = req.app.locals.socketsForUser;
@@ -48,96 +37,114 @@ function notifyFriendsChanged(req, userIds) {
   }
 }
 
-// ── GET /api/friends — list friends + pending requests ──
+// Helper: get all accepted friend IDs for a user
+async function getFriendIds(userId) {
+  const { data: rows } = await supabase
+    .from("friendships")
+    .select("user_id, friend_id")
+    .or(`user_id.eq.${userId},friend_id.eq.${userId}`)
+    .eq("status", "accepted");
+  return (rows || []).map((r) => (r.user_id === userId ? r.friend_id : r.user_id));
+}
+
+// ── GET /api/friends ──────────────────────────────────────
 router.get("/", auth, async (req, res) => {
   try {
-    const user = await User.findById(req.userId)
-      .populate("friends", "name avatar gender customization")
-      .populate("friendRequestsReceived", "name avatar gender customization")
-      .populate("friendRequestsSent", "name avatar gender customization")
-      .lean();
+    const userId = req.userId;
 
-    if (!user) return res.status(404).json({ message: "User not found." });
+    // Accepted friends
+    const { data: acceptedRows } = await supabase
+      .from("friendships")
+      .select("user_id, friend_id")
+      .or(`user_id.eq.${userId},friend_id.eq.${userId}`)
+      .eq("status", "accepted");
 
-    const friends = (user.friends || []).map((f) => ({
-      id: f._id,
-      name: f.name,
-      avatar: f.avatar,
-      gender: f.gender,
-      outfit: extractOutfit(f.customization),
-      online: isOnline(f._id),
-    }));
+    // Pending received (someone sent me a request: they are user_id, I am friend_id)
+    const { data: receivedRows } = await supabase
+      .from("friendships")
+      .select("user_id")
+      .eq("friend_id", userId)
+      .eq("status", "pending");
 
-    const received = (user.friendRequestsReceived || []).map((f) => ({
-      id: f._id,
-      name: f.name,
-      avatar: f.avatar,
-      gender: f.gender,
-      outfit: extractOutfit(f.customization),
-    }));
+    // Pending sent (I sent requests: I am user_id, they are friend_id)
+    const { data: sentRows } = await supabase
+      .from("friendships")
+      .select("friend_id")
+      .eq("user_id", userId)
+      .eq("status", "pending");
 
-    const sent = (user.friendRequestsSent || []).map((f) => ({
-      id: f._id,
-      name: f.name,
-      avatar: f.avatar,
-      gender: f.gender,
-      outfit: extractOutfit(f.customization),
-    }));
+    const friendIds   = (acceptedRows || []).map((r) => (r.user_id === userId ? r.friend_id : r.user_id));
+    const receivedIds = (receivedRows || []).map((r) => r.user_id);
+    const sentIds     = (sentRows || []).map((r) => r.friend_id);
+    const allIds      = [...new Set([...friendIds, ...receivedIds, ...sentIds])];
 
-    res.json({ friends, received, sent });
+    let profileMap = {};
+    if (allIds.length) {
+      const { data: profiles } = await supabase
+        .from("profiles")
+        .select("id, name, avatar, gender, customization")
+        .in("id", allIds);
+      for (const p of profiles || []) profileMap[p.id] = p;
+    }
+
+    const toEntry = (id) => {
+      const p = profileMap[id] || {};
+      return { id, name: p.name, avatar: p.avatar, gender: p.gender, outfit: extractOutfit(p.customization) };
+    };
+
+    res.json({
+      friends:  friendIds.map((id)   => ({ ...toEntry(id), online: isOnline(id) })),
+      received: receivedIds.map(toEntry),
+      sent:     sentIds.map(toEntry),
+    });
   } catch (err) {
     console.error("List friends error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
 
-// ── POST /api/friends/request — send a friend request ──
+// ── POST /api/friends/request ─────────────────────────────
 router.post("/request", auth, async (req, res) => {
   try {
     const { targetId } = req.body;
+    if (!isValidId(targetId)) return res.status(400).json({ message: "Invalid target id." });
+    if (targetId === req.userId) return res.status(400).json({ message: "You cannot friend yourself." });
 
-    if (!isValidId(targetId)) {
-      return res.status(400).json({ message: "Invalid target id." });
-    }
-    if (String(targetId) === String(req.userId)) {
-      return res.status(400).json({ message: "You cannot friend yourself." });
-    }
+    const { data: target } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("id", targetId)
+      .maybeSingle();
+    if (!target) return res.status(404).json({ message: "User not found." });
 
-    const [me, target] = await Promise.all([
-      User.findById(req.userId),
-      User.findById(targetId),
-    ]);
+    // Check for any existing row between these two users
+    const { data: existing } = await supabase
+      .from("friendships")
+      .select("id, user_id, friend_id, status")
+      .or(
+        `and(user_id.eq.${req.userId},friend_id.eq.${targetId}),` +
+        `and(user_id.eq.${targetId},friend_id.eq.${req.userId})`
+      )
+      .maybeSingle();
 
-    if (!me || !target) {
-      return res.status(404).json({ message: "User not found." });
-    }
-
-    if (me.friends.some((id) => String(id) === String(targetId))) {
-      return res.status(409).json({ message: "Already friends." });
-    }
-
-    // If the target had already sent me a request, accept it instead.
-    if (me.friendRequestsReceived.some((id) => String(id) === String(targetId))) {
-      me.friendRequestsReceived = me.friendRequestsReceived.filter(
-        (id) => String(id) !== String(targetId),
-      );
-      target.friendRequestsSent = target.friendRequestsSent.filter(
-        (id) => String(id) !== String(req.userId),
-      );
-      me.friends.push(target._id);
-      target.friends.push(me._id);
-      await Promise.all([me.save(), target.save()]);
+    if (existing) {
+      if (existing.status === "accepted") {
+        return res.status(409).json({ message: "Already friends." });
+      }
+      if (existing.user_id === req.userId) {
+        return res.status(409).json({ message: "Request already sent." });
+      }
+      // Target had sent me a request → accept it
+      await supabase.from("friendships").update({ status: "accepted" }).eq("id", existing.id);
       notifyFriendsChanged(req, [req.userId, targetId]);
       return res.json({ status: "accepted" });
     }
 
-    if (me.friendRequestsSent.some((id) => String(id) === String(targetId))) {
-      return res.status(409).json({ message: "Request already sent." });
-    }
-
-    me.friendRequestsSent.push(target._id);
-    target.friendRequestsReceived.push(me._id);
-    await Promise.all([me.save(), target.save()]);
+    await supabase.from("friendships").insert({
+      user_id:   req.userId,
+      friend_id: targetId,
+      status:    "pending",
+    });
 
     notifyFriendsChanged(req, [req.userId, targetId]);
     res.json({ status: "sent" });
@@ -147,43 +154,24 @@ router.post("/request", auth, async (req, res) => {
   }
 });
 
-// ── POST /api/friends/accept — accept a received request ──
+// ── POST /api/friends/accept ──────────────────────────────
 router.post("/accept", auth, async (req, res) => {
   try {
     const { userId } = req.body;
+    if (!isValidId(userId)) return res.status(400).json({ message: "Invalid user id." });
 
-    if (!isValidId(userId)) {
-      return res.status(400).json({ message: "Invalid user id." });
-    }
+    // They sent me a request: user_id = userId, friend_id = req.userId
+    const { data: row } = await supabase
+      .from("friendships")
+      .select("id, status")
+      .eq("user_id", userId)
+      .eq("friend_id", req.userId)
+      .eq("status", "pending")
+      .maybeSingle();
 
-    const [me, other] = await Promise.all([
-      User.findById(req.userId),
-      User.findById(userId),
-    ]);
+    if (!row) return res.status(400).json({ message: "No pending request from this user." });
 
-    if (!me || !other) {
-      return res.status(404).json({ message: "User not found." });
-    }
-
-    if (!me.friendRequestsReceived.some((id) => String(id) === String(userId))) {
-      return res.status(400).json({ message: "No pending request from this user." });
-    }
-
-    me.friendRequestsReceived = me.friendRequestsReceived.filter(
-      (id) => String(id) !== String(userId),
-    );
-    other.friendRequestsSent = other.friendRequestsSent.filter(
-      (id) => String(id) !== String(req.userId),
-    );
-
-    if (!me.friends.some((id) => String(id) === String(userId))) {
-      me.friends.push(other._id);
-    }
-    if (!other.friends.some((id) => String(id) === String(req.userId))) {
-      other.friends.push(me._id);
-    }
-
-    await Promise.all([me.save(), other.save()]);
+    await supabase.from("friendships").update({ status: "accepted" }).eq("id", row.id);
     notifyFriendsChanged(req, [req.userId, userId]);
     res.json({ status: "accepted" });
   } catch (err) {
@@ -192,21 +180,18 @@ router.post("/accept", auth, async (req, res) => {
   }
 });
 
-// ── POST /api/friends/decline — decline a received request ──
+// ── POST /api/friends/decline ─────────────────────────────
 router.post("/decline", auth, async (req, res) => {
   try {
     const { userId } = req.body;
+    if (!isValidId(userId)) return res.status(400).json({ message: "Invalid user id." });
 
-    if (!isValidId(userId)) {
-      return res.status(400).json({ message: "Invalid user id." });
-    }
-
-    await User.findByIdAndUpdate(req.userId, {
-      $pull: { friendRequestsReceived: userId },
-    });
-    await User.findByIdAndUpdate(userId, {
-      $pull: { friendRequestsSent: req.userId },
-    });
+    await supabase
+      .from("friendships")
+      .delete()
+      .eq("user_id", userId)
+      .eq("friend_id", req.userId)
+      .eq("status", "pending");
 
     notifyFriendsChanged(req, [req.userId, userId]);
     res.json({ status: "declined" });
@@ -216,21 +201,18 @@ router.post("/decline", auth, async (req, res) => {
   }
 });
 
-// ── POST /api/friends/cancel — cancel a sent request ──
+// ── POST /api/friends/cancel ──────────────────────────────
 router.post("/cancel", auth, async (req, res) => {
   try {
     const { userId } = req.body;
+    if (!isValidId(userId)) return res.status(400).json({ message: "Invalid user id." });
 
-    if (!isValidId(userId)) {
-      return res.status(400).json({ message: "Invalid user id." });
-    }
-
-    await User.findByIdAndUpdate(req.userId, {
-      $pull: { friendRequestsSent: userId },
-    });
-    await User.findByIdAndUpdate(userId, {
-      $pull: { friendRequestsReceived: req.userId },
-    });
+    await supabase
+      .from("friendships")
+      .delete()
+      .eq("user_id", req.userId)
+      .eq("friend_id", userId)
+      .eq("status", "pending");
 
     notifyFriendsChanged(req, [req.userId, userId]);
     res.json({ status: "cancelled" });
@@ -240,17 +222,20 @@ router.post("/cancel", auth, async (req, res) => {
   }
 });
 
-// ── DELETE /api/friends/:id — remove a friend ──
+// ── DELETE /api/friends/:id ───────────────────────────────
 router.delete("/:id", auth, async (req, res) => {
   try {
     const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ message: "Invalid user id." });
 
-    if (!isValidId(id)) {
-      return res.status(400).json({ message: "Invalid user id." });
-    }
-
-    await User.findByIdAndUpdate(req.userId, { $pull: { friends: id } });
-    await User.findByIdAndUpdate(id, { $pull: { friends: req.userId } });
+    await supabase
+      .from("friendships")
+      .delete()
+      .or(
+        `and(user_id.eq.${req.userId},friend_id.eq.${id}),` +
+        `and(user_id.eq.${id},friend_id.eq.${req.userId})`
+      )
+      .eq("status", "accepted");
 
     notifyFriendsChanged(req, [req.userId, id]);
     res.json({ status: "removed" });
@@ -261,3 +246,4 @@ router.delete("/:id", auth, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.getFriendIds = getFriendIds;
