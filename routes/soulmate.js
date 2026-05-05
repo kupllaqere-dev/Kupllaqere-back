@@ -23,6 +23,15 @@ function notifySoulMateChanged(req, userIds) {
   }
 }
 
+function notifySoulMateRequest(req, toUserId, fromName) {
+  const io = req.app.locals.io;
+  const socketsForUser = req.app.locals.socketsForUser;
+  if (!io || !socketsForUser) return;
+  for (const sid of socketsForUser(String(toUserId))) {
+    io.to(sid).emit("soulmate:request", { from: { id: req.userId, name: fromName } });
+  }
+}
+
 // Build current soulmate state for a user from the soulmates table.
 // soulmates rows: { user_id, partner_id, status: 'pending'|'accepted' }
 async function buildOwnState(userId) {
@@ -212,8 +221,10 @@ router.post("/request", auth, async (req, res) => {
       notifySoulMateChanged(req, [prevSent.partner_id]);
     }
 
+    const { data: me } = await supabase.from("profiles").select("name").eq("id", req.userId).single();
     await supabase.from("soulmates").insert({ user_id: req.userId, partner_id: targetId, status: "pending" });
     notifySoulMateChanged(req, [req.userId, targetId]);
+    notifySoulMateRequest(req, targetId, me?.name || "Someone");
     res.json({ status: "sent" });
   } catch (err) {
     console.error("Send soul mate request error:", err);

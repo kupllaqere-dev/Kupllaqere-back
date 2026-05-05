@@ -212,7 +212,27 @@ CREATE TRIGGER on_auth_user_created
   FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
 
 
--- ── 10. Email sync trigger ────────────────────────────────────
+-- ── 10. RLS policies ─────────────────────────────────────────
+-- Grant service_role full access to all tables so that inserts/updates
+-- from the Express backend work even if BYPASSRLS is not set on the role.
+DROP POLICY IF EXISTS "service_role_all_mail"       ON mail;
+DROP POLICY IF EXISTS "service_role_all_profiles"   ON profiles;
+DROP POLICY IF EXISTS "service_role_all_friendships" ON friendships;
+DROP POLICY IF EXISTS "service_role_all_inventory"  ON inventory;
+DROP POLICY IF EXISTS "service_role_all_items"      ON items;
+DROP POLICY IF EXISTS "service_role_all_submissions" ON submissions;
+DROP POLICY IF EXISTS "service_role_all_guestbook"  ON guestbook_comments;
+
+CREATE POLICY "allow_all_mail"        ON mail              FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_profiles"    ON profiles          FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_friendships" ON friendships       FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_inventory"   ON inventory         FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_items"       ON items             FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_submissions" ON submissions       FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_guestbook"   ON guestbook_comments FOR ALL USING (true) WITH CHECK (true);
+
+
+-- ── 11. Email sync trigger ────────────────────────────────────
 -- Keeps profiles.email in sync if the user changes their email in Supabase Auth.
 CREATE OR REPLACE FUNCTION public.handle_user_email_update()
 RETURNS TRIGGER
