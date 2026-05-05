@@ -170,12 +170,24 @@ router.post("/guest", guestLimiter, async (req, res) => {
 // ── Me (used after OAuth redirect to fetch profile) ───────
 router.get("/me", auth, async (req, res) => {
   try {
-    const { data: profile, error } = await supabase
+    let { data: profile } = await supabase
       .from("profiles")
       .select("*")
       .eq("id", req.userId)
       .single();
-    if (error || !profile) return res.status(404).json({ message: "Profile not found." });
+
+    if (!profile) {
+      // Auth user exists but profile was deleted — recreate it
+      const { data: { user: authUser } } = await supabase.auth.admin.getUserById(req.userId);
+      const { data: created, error: insertError } = await supabase
+        .from("profiles")
+        .insert({ id: req.userId, email: authUser?.email || null })
+        .select()
+        .single();
+      if (insertError || !created) return res.status(404).json({ message: "Profile not found." });
+      profile = created;
+    }
+
     res.json({ user: toPublic(profile) });
   } catch (err) {
     console.error("Me error:", err);
