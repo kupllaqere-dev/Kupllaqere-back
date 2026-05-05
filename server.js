@@ -18,47 +18,50 @@ const supabase = require("./lib/supabase");
 const { CATEGORY_SUBCATEGORIES } = require("./lib/categories");
 const online = require("./lib/online");
 
-// Build full outfit object from customization JSONB (looks up item IDs from DB)
-async function buildOutfit(customization) {
+// Build full outfit object from equipped_items table
+async function buildOutfit(userId) {
   const outfit = {};
-  if (!customization) return outfit;
-  for (const category of Object.keys(CATEGORY_SUBCATEGORIES)) {
-    const subs = customization[category];
-    if (!subs) continue;
-    for (const sub of Object.keys(subs)) {
-      const imageUrl = subs[sub];
-      if (!imageUrl) continue;
-      const { data: item } = await supabase
-        .from("items")
-        .select("id")
-        .eq("image_url", imageUrl)
-        .eq("category", category)
-        .eq("subcategory", sub)
-        .maybeSingle();
-      if (item) {
-        outfit[category] = { itemId: item.id, imageUrl };
-        break;
-      }
-    }
+  if (!userId) return outfit;
+  const { data: equippedRows } = await supabase
+    .from("equipped_items")
+    .select("slot, item_id")
+    .eq("user_id", userId);
+  if (!equippedRows || equippedRows.length === 0) return outfit;
+  const itemIds = equippedRows.map((r) => r.item_id);
+  const { data: items } = await supabase
+    .from("items")
+    .select("id, image_url")
+    .in("id", itemIds);
+  const itemMap = new Map((items || []).map((i) => [i.id, i.image_url]));
+  for (const row of equippedRows) {
+    const imageUrl = itemMap.get(row.item_id);
+    if (imageUrl) outfit[row.slot] = { itemId: row.item_id, imageUrl };
   }
   return outfit;
 }
 
-// Lightweight outfit for friend thumbnails — just the first imageUrl per category
-function extractOutfitShallow(customization) {
-  const outfit = {};
-  if (!customization) return outfit;
-  for (const [cat, subs] of Object.entries(customization)) {
-    if (!subs || typeof subs !== "object") continue;
-    for (const sub of Object.keys(subs)) {
-      const url = subs[sub];
-      if (url) {
-        outfit[cat] = { imageUrl: url };
-        break;
-      }
-    }
+// Build outfit summaries for a batch of userIds from equipped_items
+async function buildOutfitsBatch(userIds) {
+  if (!userIds || userIds.length === 0) return {};
+  const { data: equippedRows } = await supabase
+    .from("equipped_items")
+    .select("user_id, slot, item_id")
+    .in("user_id", userIds);
+  if (!equippedRows || equippedRows.length === 0) return {};
+  const allItemIds = [...new Set(equippedRows.map((r) => r.item_id))];
+  const { data: items } = await supabase
+    .from("items")
+    .select("id, image_url")
+    .in("id", allItemIds);
+  const itemMap = new Map((items || []).map((i) => [i.id, i.image_url]));
+  const outfitMap = {};
+  for (const row of equippedRows) {
+    const imageUrl = itemMap.get(row.item_id);
+    if (!imageUrl) continue;
+    if (!outfitMap[row.user_id]) outfitMap[row.user_id] = {};
+    outfitMap[row.user_id][row.slot] = { imageUrl };
   }
-  return outfit;
+  return outfitMap;
 }
 
 const app = express();
@@ -163,12 +166,12 @@ io.on("connection", (socket) => {
       try {
         const { data: profile } = await supabase
           .from("profiles")
-          .select("id, gender, bio, selected_badge, customization")
+          .select("id, gender, bio, selected_badge")
           .eq("id", data.userId)
           .single();
 
         if (profile) {
-          player.outfit        = await buildOutfit(profile.customization);
+          player.outfit        = await buildOutfit(data.userId);
           player.gender        = profile.gender || player.gender;
           player.bio           = profile.bio || "";
           player.selectedBadge = profile.selected_badge || null;
@@ -191,13 +194,14 @@ io.on("connection", (socket) => {
           if (onlineFriendIds.length) {
             const { data: friendProfiles } = await supabase
               .from("profiles")
-              .select("id, name, gender, customization")
+              .select("id, name, gender")
               .in("id", onlineFriendIds);
+            const friendOutfits = await buildOutfitsBatch(onlineFriendIds);
             onlineFriendSummaries = (friendProfiles || []).map((f) => ({
               id:     f.id,
               name:   f.name,
               gender: f.gender,
-              outfit: extractOutfitShallow(f.customization),
+              outfit: friendOutfits[f.id] || {},
             }));
           }
           socket.emit("friends:online", onlineFriendSummaries);
@@ -208,7 +212,7 @@ io.on("connection", (socket) => {
               id:     profile.id,
               name:   data.name || "",
               gender: profile.gender,
-              outfit: extractOutfitShallow(profile.customization),
+              outfit: player.outfit,
             };
             for (const fid of friendIds) {
               for (const sid of socketsForUser(fid)) {

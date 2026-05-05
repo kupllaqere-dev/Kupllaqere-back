@@ -125,6 +125,7 @@ router.get("/inventory", auth, async (req, res) => {
         itemId:           r.item_id,
         currency:         r.currency,
         amountPaid:       r.amount_paid,
+        acquiredAt:       r.acquired_at,
         name:             r.items.name,
         category:         r.items.category,
         subcategory:      r.items.subcategory,

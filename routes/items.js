@@ -98,33 +98,23 @@ router.get("/", auth, async (req, res) => {
 // GET /api/items/outfit — get current user's equipped outfit
 router.get("/outfit", auth, async (req, res) => {
   try {
-    const { data: profile, error: pErr } = await supabase
-      .from("profiles")
-      .select("customization")
-      .eq("id", req.userId)
-      .single();
-    if (pErr || !profile) return res.status(404).json({ message: "User not found." });
+    const { data: equippedRows, error } = await supabase
+      .from("equipped_items")
+      .select("slot, item_id")
+      .eq("user_id", req.userId);
+    if (error) throw error;
 
-    const customization = profile.customization || {};
     const outfit = {};
-
-    for (const category of Object.keys(CATEGORY_SUBCATEGORIES)) {
-      const subs = customization[category];
-      if (!subs) continue;
-      for (const sub of Object.keys(subs)) {
-        const imageUrl = subs[sub];
-        if (!imageUrl) continue;
-        const { data: item } = await supabase
-          .from("items")
-          .select("id, image_url")
-          .eq("image_url", imageUrl)
-          .eq("category", category)
-          .eq("subcategory", sub)
-          .maybeSingle();
-        if (item) {
-          outfit[category] = { itemId: item.id, imageUrl };
-          break;
-        }
+    if (equippedRows && equippedRows.length > 0) {
+      const itemIds = equippedRows.map((r) => r.item_id);
+      const { data: items } = await supabase
+        .from("items")
+        .select("id, image_url")
+        .in("id", itemIds);
+      const itemMap = new Map((items || []).map((i) => [i.id, i.image_url]));
+      for (const row of equippedRows) {
+        const imageUrl = itemMap.get(row.item_id);
+        if (imageUrl) outfit[row.slot] = { itemId: row.item_id, imageUrl };
       }
     }
 
@@ -160,22 +150,19 @@ router.put("/outfit", auth, async (req, res) => {
       itemEntries.push({ category, item });
     }
 
-    const customization = {};
-    for (const category of Object.keys(CATEGORY_SUBCATEGORIES)) {
-      customization[category] = {};
-      for (const sub of CATEGORY_SUBCATEGORIES[category]) {
-        customization[category][sub] = null;
-      }
-    }
-    for (const { category, item } of itemEntries) {
-      customization[category][item.subcategory] = item.image_url;
-    }
+    // Replace all equipped items for this user
+    await supabase.from("equipped_items").delete().eq("user_id", req.userId);
 
-    const { error } = await supabase
-      .from("profiles")
-      .update({ customization })
-      .eq("id", req.userId);
-    if (error) throw error;
+    if (itemEntries.length > 0) {
+      const rows = itemEntries.map(({ category, item }) => ({
+        user_id:     req.userId,
+        slot:        category,
+        subcategory: item.subcategory,
+        item_id:     item.id,
+      }));
+      const { error: insertErr } = await supabase.from("equipped_items").insert(rows);
+      if (insertErr) throw insertErr;
+    }
 
     res.json({ success: true });
   } catch (err) {
