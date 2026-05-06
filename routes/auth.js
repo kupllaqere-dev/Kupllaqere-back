@@ -92,7 +92,7 @@ router.post("/register", registerLimiter, async (req, res) => {
       .single();
     if (profileError || !profile) return res.status(500).json({ message: "Profile creation failed." });
 
-    res.status(201).json({ user: toPublic(profile), token: data.session.access_token });
+    res.status(201).json({ user: toPublic(profile), token: data.session.access_token, refreshToken: data.session.refresh_token });
   } catch (err) {
     console.error("Registration error:", err);
     res.status(500).json({ message: "Server error." });
@@ -120,7 +120,7 @@ router.post("/login", loginLimiter, async (req, res) => {
       .single();
     if (profileError || !profile) return res.status(404).json({ message: "Profile not found." });
 
-    res.json({ user: toPublic(profile), token: session.access_token });
+    res.json({ user: toPublic(profile), token: session.access_token, refreshToken: session.refresh_token });
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
@@ -160,7 +160,7 @@ router.post("/guest", guestLimiter, async (req, res) => {
       .eq("id", user.id)
       .single();
 
-    res.status(201).json({ user: toPublic(profile), token: session.access_token });
+    res.status(201).json({ user: toPublic(profile), token: session.access_token, refreshToken: session.refresh_token });
   } catch (err) {
     console.error("Guest creation error:", err);
     res.status(500).json({ message: "Server error." });
@@ -218,6 +218,22 @@ router.post("/setup", auth, async (req, res) => {
     res.json({ user: toPublic(profile) });
   } catch (err) {
     console.error("Setup error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// ── Refresh token ─────────────────────────────────────────
+router.post("/refresh", async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(400).json({ message: "Refresh token required." });
+
+    const { data: { session }, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
+    if (error || !session) return res.status(401).json({ message: "Invalid or expired refresh token." });
+
+    res.json({ token: session.access_token, refreshToken: session.refresh_token });
+  } catch (err) {
+    console.error("Refresh error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
