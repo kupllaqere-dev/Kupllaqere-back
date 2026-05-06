@@ -35,12 +35,13 @@ function notifySoulMateRequest(req, toUserId, fromName) {
 // Build current soulmate state for a user from the soulmates table.
 // soulmates rows: { user_id, partner_id, status: 'pending'|'accepted' }
 async function buildOwnState(userId) {
-  const { data: acceptedRow } = await supabase
+  const { data: acceptedRows } = await supabase
     .from("soulmates")
     .select("user_id, partner_id")
     .or(`user_id.eq.${userId},partner_id.eq.${userId}`)
     .eq("status", "accepted")
-    .maybeSingle();
+    .limit(1);
+  const acceptedRow = acceptedRows?.[0] ?? null;
 
   let mine = null;
   if (acceptedRow) {
@@ -167,16 +168,16 @@ router.post("/request", auth, async (req, res) => {
     if (!target) return res.status(404).json({ message: "User not found." });
 
     // Check if either party already has an accepted soulmate
-    const [{ data: myAccepted }, { data: theirAccepted }] = await Promise.all([
+    const [{ data: myAcceptedRows }, { data: theirAcceptedRows }] = await Promise.all([
       supabase.from("soulmates").select("id")
         .or(`user_id.eq.${req.userId},partner_id.eq.${req.userId}`)
-        .eq("status", "accepted").maybeSingle(),
+        .eq("status", "accepted").limit(1),
       supabase.from("soulmates").select("id")
         .or(`user_id.eq.${targetId},partner_id.eq.${targetId}`)
-        .eq("status", "accepted").maybeSingle(),
+        .eq("status", "accepted").limit(1),
     ]);
-    if (myAccepted) return res.status(409).json({ message: "You already have a soul mate." });
-    if (theirAccepted) return res.status(409).json({ message: "That player already has a soul mate." });
+    if (myAcceptedRows?.length > 0) return res.status(409).json({ message: "You already have a soul mate." });
+    if (theirAcceptedRows?.length > 0) return res.status(409).json({ message: "That player already has a soul mate." });
 
     // Check if I already sent a request to this person
     const { data: alreadySent } = await supabase
@@ -202,7 +203,8 @@ router.post("/request", auth, async (req, res) => {
       await supabase.from("soulmates").delete()
         .or(`user_id.eq.${req.userId},partner_id.eq.${req.userId},user_id.eq.${targetId},partner_id.eq.${targetId}`)
         .eq("status", "pending");
-      await supabase.from("soulmates").insert({ user_id: targetId, partner_id: req.userId, status: "accepted" });
+      const { error: acceptErr } = await supabase.from("soulmates").insert({ user_id: targetId, partner_id: req.userId, status: "accepted" });
+      if (acceptErr) { console.error("Soulmate accept insert error:", acceptErr); return res.status(500).json({ message: "Server error." }); }
       notifySoulMateChanged(req, [req.userId, targetId]);
       return res.json({ status: "accepted" });
     }
@@ -222,7 +224,8 @@ router.post("/request", auth, async (req, res) => {
     }
 
     const { data: me } = await supabase.from("profiles").select("name").eq("id", req.userId).single();
-    await supabase.from("soulmates").insert({ user_id: req.userId, partner_id: targetId, status: "pending" });
+    const { error: insertErr } = await supabase.from("soulmates").insert({ user_id: req.userId, partner_id: targetId, status: "pending" });
+    if (insertErr) { console.error("Soulmate request insert error:", insertErr); return res.status(500).json({ message: "Server error." }); }
     notifySoulMateChanged(req, [req.userId, targetId]);
     notifySoulMateRequest(req, targetId, me?.name || "Someone");
     res.json({ status: "sent" });
@@ -239,16 +242,16 @@ router.post("/accept", auth, async (req, res) => {
     if (!isValidId(userId)) return res.status(400).json({ message: "Invalid user id." });
 
     // Check neither party already has an accepted soulmate
-    const [{ data: myAccepted }, { data: theirAccepted }] = await Promise.all([
+    const [{ data: myAcceptedRows }, { data: theirAcceptedRows }] = await Promise.all([
       supabase.from("soulmates").select("id")
         .or(`user_id.eq.${req.userId},partner_id.eq.${req.userId}`)
-        .eq("status", "accepted").maybeSingle(),
+        .eq("status", "accepted").limit(1),
       supabase.from("soulmates").select("id")
         .or(`user_id.eq.${userId},partner_id.eq.${userId}`)
-        .eq("status", "accepted").maybeSingle(),
+        .eq("status", "accepted").limit(1),
     ]);
-    if (myAccepted) return res.status(409).json({ message: "You already have a soul mate." });
-    if (theirAccepted) return res.status(409).json({ message: "That player already has a soul mate." });
+    if (myAcceptedRows?.length > 0) return res.status(409).json({ message: "You already have a soul mate." });
+    if (theirAcceptedRows?.length > 0) return res.status(409).json({ message: "That player already has a soul mate." });
 
     // They sent me a request: user_id = userId, partner_id = req.userId
     const { data: request } = await supabase
@@ -279,7 +282,8 @@ router.post("/accept", auth, async (req, res) => {
       .eq("status", "pending");
 
     // Insert accepted pair (initiator = userId since they asked)
-    await supabase.from("soulmates").insert({ user_id: userId, partner_id: req.userId, status: "accepted" });
+    const { error: acceptErr } = await supabase.from("soulmates").insert({ user_id: userId, partner_id: req.userId, status: "accepted" });
+    if (acceptErr) { console.error("Soulmate accept insert error:", acceptErr); return res.status(500).json({ message: "Server error." }); }
 
     notifySoulMateChanged(req, Array.from(notifyIds));
     res.json({ status: "accepted" });
