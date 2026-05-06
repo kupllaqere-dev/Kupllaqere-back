@@ -364,4 +364,56 @@ router.patch("/badge", auth, async (req, res) => {
   }
 });
 
+// ── Save profile view (pose, zoom, pan) ──────────────────
+router.patch("/profile-view", auth, async (req, res) => {
+  try {
+    const { poseIndex, zoomIndex, panX, panY } = req.body;
+    if (!Number.isInteger(poseIndex) || poseIndex < 0 || poseIndex > 5)
+      return res.status(400).json({ message: "Invalid poseIndex." });
+    if (!Number.isInteger(zoomIndex) || zoomIndex < 0 || zoomIndex > 4)
+      return res.status(400).json({ message: "Invalid zoomIndex." });
+    if (typeof panX !== "number" || typeof panY !== "number")
+      return res.status(400).json({ message: "Invalid pan values." });
+
+    const { error } = await supabase
+      .from("profiles")
+      .update({
+        profile_pose_index:  poseIndex,
+        profile_zoom_index:  zoomIndex,
+        profile_pan_x:       panX,
+        profile_pan_y:       panY,
+        profile_view_locked: true,
+      })
+      .eq("id", req.userId);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Profile view save error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// ── Clear profile view lock ───────────────────────────────
+router.delete("/profile-view", auth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from("profiles")
+      .update({
+        profile_view_locked: false,
+        profile_pose_index:  0,
+        profile_zoom_index:  0,
+        profile_pan_x:       0,
+        profile_pan_y:       0,
+      })
+      .eq("id", req.userId);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Profile view unlock error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
 module.exports = router;

@@ -242,4 +242,87 @@ router.post("/purchase", auth, async (req, res) => {
   }
 });
 
+// ── GET /api/store/wishlist ───────────────────────────────
+router.get("/wishlist", auth, async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from("wishlist")
+      .select(`
+        id,
+        item_id,
+        added_at,
+        items (
+          id,
+          name,
+          category,
+          subcategory,
+          image_url,
+          thumbnail_url,
+          store_type,
+          rarity
+        )
+      `)
+      .eq("user_id", req.userId)
+      .order("added_at", { ascending: false });
+    if (error) throw error;
+
+    const items = (rows || [])
+      .filter((r) => r.items)
+      .map((r) => ({
+        wishlistId:  r.id,
+        itemId:      r.item_id,
+        addedAt:     r.added_at,
+        name:        r.items.name,
+        category:    r.items.category,
+        subcategory: r.items.subcategory,
+        imageUrl:    r.items.image_url,
+        thumbnailUrl: r.items.thumbnail_url,
+        storeType:   r.items.store_type,
+        rarity:      r.items.rarity || null,
+      }));
+
+    res.json({ items });
+  } catch (err) {
+    console.error("Wishlist fetch error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// ── POST /api/store/wishlist ──────────────────────────────
+router.post("/wishlist", auth, async (req, res) => {
+  try {
+    const { itemId } = req.body;
+    if (!itemId) return res.status(400).json({ message: "itemId is required." });
+
+    const { error } = await supabase
+      .from("wishlist")
+      .insert({ user_id: req.userId, item_id: itemId });
+    if (error) {
+      if (error.code === "23505") return res.json({ success: true }); // already wishlisted
+      throw error;
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Wishlist add error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// ── DELETE /api/store/wishlist/:itemId ────────────────────
+router.delete("/wishlist/:itemId", auth, async (req, res) => {
+  try {
+    const { itemId } = req.params;
+    const { error } = await supabase
+      .from("wishlist")
+      .delete()
+      .eq("user_id", req.userId)
+      .eq("item_id", itemId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Wishlist remove error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
 module.exports = router;
