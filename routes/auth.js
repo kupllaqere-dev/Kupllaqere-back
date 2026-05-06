@@ -222,21 +222,6 @@ router.post("/setup", auth, async (req, res) => {
   }
 });
 
-// ── Refresh token ─────────────────────────────────────────
-router.post("/refresh", async (req, res) => {
-  try {
-    const { refreshToken } = req.body;
-    if (!refreshToken) return res.status(400).json({ message: "Refresh token required." });
-
-    const { data: { session }, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
-    if (error || !session) return res.status(401).json({ message: "Invalid or expired refresh token." });
-
-    res.json({ token: session.access_token, refreshToken: session.refresh_token });
-  } catch (err) {
-    console.error("Refresh error:", err);
-    res.status(500).json({ message: "Server error." });
-  }
-});
 
 function extractOutfitShallow(customization) {
   const outfit = {};
