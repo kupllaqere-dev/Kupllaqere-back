@@ -421,26 +421,11 @@ router.patch("/presence", auth, async (req, res) => {
     const effective = online.getEffectiveStatus(req.userId);
     online.setLastEmitted(req.userId, effective);
 
-    // Notify friends of the new effective status
-    const { data: friendships } = await supabase
-      .from("friendships")
-      .select("user_id, friend_id")
-      .or(`user_id.eq.${req.userId},friend_id.eq.${req.userId}`)
-      .eq("status", "accepted");
-
-    const friendIds = (friendships || []).map((f) =>
-      f.user_id === req.userId ? f.friend_id : f.user_id
-    );
-
     const io = req.app.locals.io;
     const socketsForUser = req.app.locals.socketsForUser;
     if (io && socketsForUser) {
-      const friendPayload = { userId: String(req.userId), status: effective };
-      for (const fid of friendIds) {
-        for (const sid of socketsForUser(fid)) {
-          io.to(sid).emit("friend:status", friendPayload);
-        }
-      }
+      // Broadcast to all connected clients — the client filters by userId
+      io.emit("friend:status", { userId: String(req.userId), status: effective, manualStatus: status });
       // Notify self (so other open tabs update)
       const selfPayload = { status: effective, manualStatus: status };
       for (const sid of socketsForUser(req.userId)) {
