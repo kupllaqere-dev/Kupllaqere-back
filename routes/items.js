@@ -151,7 +151,8 @@ router.put("/outfit", auth, async (req, res) => {
     }
 
     // Replace all equipped items for this user
-    await supabase.from("equipped_items").delete().eq("user_id", req.userId);
+    const { error: deleteErr } = await supabase.from("equipped_items").delete().eq("user_id", req.userId);
+    if (deleteErr) throw deleteErr;
 
     if (itemEntries.length > 0) {
       const rows = itemEntries.map(({ category, item }) => ({
