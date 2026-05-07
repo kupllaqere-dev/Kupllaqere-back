@@ -401,4 +401,58 @@ router.delete("/profile-view", auth, async (req, res) => {
   }
 });
 
+// ── Update presence status ────────────────────────────────
+const ALLOWED_PRESENCE = ["online", "away", "invisible"];
+
+router.patch("/presence", auth, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!ALLOWED_PRESENCE.includes(status)) {
+      return res.status(400).json({ message: "Invalid status. Use: online, away, invisible." });
+    }
+
+    await supabase
+      .from("profiles")
+      .update({ presence_status: status })
+      .eq("id", req.userId);
+
+    const online = require("../lib/online");
+    online.setManualStatus(req.userId, status);
+    const effective = online.getEffectiveStatus(req.userId);
+    online.setLastEmitted(req.userId, effective);
+
+    // Notify friends of the new effective status
+    const { data: friendships } = await supabase
+      .from("friendships")
+      .select("user_id, friend_id")
+      .or(`user_id.eq.${req.userId},friend_id.eq.${req.userId}`)
+      .eq("status", "accepted");
+
+    const friendIds = (friendships || []).map((f) =>
+      f.user_id === req.userId ? f.friend_id : f.user_id
+    );
+
+    const io = req.app.locals.io;
+    const socketsForUser = req.app.locals.socketsForUser;
+    if (io && socketsForUser) {
+      const friendPayload = { userId: String(req.userId), status: effective };
+      for (const fid of friendIds) {
+        for (const sid of socketsForUser(fid)) {
+          io.to(sid).emit("friend:status", friendPayload);
+        }
+      }
+      // Notify self (so other open tabs update)
+      const selfPayload = { status: effective, manualStatus: status };
+      for (const sid of socketsForUser(req.userId)) {
+        io.to(sid).emit("user:status", selfPayload);
+      }
+    }
+
+    res.json({ status: effective, manualStatus: status });
+  } catch (err) {
+    console.error("Presence update error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
 module.exports = router;

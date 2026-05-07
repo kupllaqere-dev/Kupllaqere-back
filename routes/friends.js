@@ -1,7 +1,7 @@
 const express = require("express");
 const auth = require("../middleware/auth");
 const supabase = require("../lib/supabase");
-const { isOnline } = require("../lib/online");
+const { isOnline, getEffectiveStatus } = require("../lib/online");
 
 const router = express.Router();
 
@@ -93,7 +93,7 @@ router.get("/", auth, async (req, res) => {
     };
 
     res.json({
-      friends:  friendIds.map((id)   => ({ ...toEntry(id), online: isOnline(id) })),
+      friends:  friendIds.map((id)   => ({ ...toEntry(id), online: isOnline(id), status: getEffectiveStatus(id) })),
       received: receivedIds.map(toEntry),
       sent:     sentIds.map(toEntry),
     });

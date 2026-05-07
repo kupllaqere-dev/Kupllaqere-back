@@ -270,6 +270,40 @@ router.post("/send", auth, async (req, res) => {
   }
 });
 
+// GET /api/mail/conversations — all threads the user is part of, deduped by other participant
+router.get("/conversations", auth, async (req, res) => {
+  try {
+    const { data: allMails } = await supabase
+      .from("mail")
+      .select("thread_id")
+      .or(`from_id.eq.${req.userId},to_id.eq.${req.userId}`);
+
+    const threadIds = [...new Set((allMails || []).map((m) => m.thread_id))];
+    if (!threadIds.length) return res.json([]);
+
+    const summaries = await buildThreadSummaries(threadIds, req.userId);
+
+    // Dedup by otherParticipant.id, keeping the most recent thread
+    const byParticipant = new Map();
+    for (const s of summaries) {
+      const pid = s.otherParticipant.id;
+      const existing = byParticipant.get(pid);
+      if (!existing || new Date(s.lastMessage.createdAt) > new Date(existing.lastMessage.createdAt)) {
+        byParticipant.set(pid, s);
+      }
+    }
+
+    const result = [...byParticipant.values()].sort(
+      (a, b) => new Date(b.lastMessage.createdAt) - new Date(a.lastMessage.createdAt)
+    );
+
+    res.json(result);
+  } catch (err) {
+    console.error("Conversations error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
 // POST /api/mail/reply
 router.post("/reply", auth, async (req, res) => {
   try {

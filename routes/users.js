@@ -1,5 +1,6 @@
 const express = require("express");
 const supabase = require("../lib/supabase");
+const online   = require("../lib/online");
 
 const router = express.Router();
 
@@ -37,6 +38,35 @@ router.get("/appearance/:name", async (req, res) => {
     res.json({ gender: user.gender, outfit });
   } catch (err) {
     console.error("Appearance lookup error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// GET /api/users/:id/status — returns effective presence status and manual preference
+router.get("/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (online.isOnline(id)) {
+      return res.json({
+        status:       online.getEffectiveStatus(id),
+        manualStatus: online.getManualStatus(id),
+      });
+    }
+
+    // User is offline — check DB for their saved manual preference
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("presence_status")
+      .eq("id", id)
+      .maybeSingle();
+
+    res.json({
+      status:       "offline",
+      manualStatus: profile?.presence_status || "online",
+    });
+  } catch (err) {
+    console.error("Status fetch error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });

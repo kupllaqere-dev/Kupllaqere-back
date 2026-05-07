@@ -166,7 +166,7 @@ io.on("connection", (socket) => {
       try {
         const { data: profile } = await supabase
           .from("profiles")
-          .select("id, gender, bio, selected_badge")
+          .select("id, gender, bio, selected_badge, presence_status")
           .eq("id", data.userId)
           .single();
 
@@ -176,7 +176,13 @@ io.on("connection", (socket) => {
           player.bio           = profile.bio || "";
           player.selectedBadge = profile.selected_badge || null;
 
+          // Load manual status before computing effective status
+          online.setManualStatus(data.userId, profile.presence_status || "online");
+          online.add(data.userId);
+
           const wasFirstSocket = addUserSocket(data.userId, socket.id);
+          const effectiveStatus = online.getEffectiveStatus(data.userId);
+          online.setLastEmitted(data.userId, effectiveStatus);
 
           // Tell this client which friends are currently online
           const { data: friendships } = await supabase
@@ -202,29 +208,32 @@ io.on("connection", (socket) => {
               name:   f.name,
               gender: f.gender,
               outfit: friendOutfits[f.id] || {},
+              status: online.getEffectiveStatus(f.id),
             }));
           }
           socket.emit("friends:online", onlineFriendSummaries);
 
-          // Notify this user's friends that they came online
+          // Notify friends of status (only on first socket connection)
           if (wasFirstSocket && friendIds.length) {
             const mySummary = {
               id:     profile.id,
               name:   data.name || "",
               gender: profile.gender,
               outfit: player.outfit,
+              status: effectiveStatus,
             };
             for (const fid of friendIds) {
               for (const sid of socketsForUser(fid)) {
                 io.to(sid).emit("friend:online", mySummary);
+                io.to(sid).emit("friend:status", { userId: String(profile.id), status: effectiveStatus });
               }
             }
           }
         }
       } catch (err) {
         console.error("Failed to load outfit:", err);
+        online.add(data.userId);
       }
-      online.add(data.userId);
     }
 
     players.set(socket.id, player);
@@ -246,6 +255,7 @@ io.on("connection", (socket) => {
     player.direction = data.direction ?? player.direction;
     player.anim      = data.anim      ?? null;
     dirtyPlayers.add(socket.id);
+    if (player.userId) online.updateActivity(player.userId);
   });
 
   socket.on("player:teleport", (data) => {
@@ -352,6 +362,8 @@ io.on("connection", (socket) => {
         online.remove(player.userId);
         const wasLastSocket = removeUserSocket(player.userId, socket.id);
         if (wasLastSocket) {
+          online.clearManualStatus(player.userId);
+          online.setLastEmitted(player.userId, "offline");
           (async () => {
             try {
               const { data: friendships } = await supabase
@@ -363,10 +375,12 @@ io.on("connection", (socket) => {
               const friendIds = (friendships || []).map((f) =>
                 f.user_id === player.userId ? f.friend_id : f.user_id
               );
-              const payload = { id: String(player.userId) };
+              const payload   = { id: String(player.userId) };
+              const statusPayload = { userId: String(player.userId), status: "offline" };
               for (const fid of friendIds) {
                 for (const sid of socketsForUser(fid)) {
                   io.to(sid).emit("friend:offline", payload);
+                  io.to(sid).emit("friend:status", statusPayload);
                 }
               }
             } catch (err) {
@@ -381,6 +395,32 @@ io.on("connection", (socket) => {
     console.log(`${player?.name || "Unknown"} disconnected (${players.size} players online)`);
   });
 });
+
+// Periodic away-detection: every 30 s check for online→away transitions and emit friend:status
+setInterval(async () => {
+  const changes = online.checkStatusChanges();
+  if (changes.length === 0) return;
+  for (const { userId, status } of changes) {
+    try {
+      const { data: friendships } = await supabase
+        .from("friendships")
+        .select("user_id, friend_id")
+        .or(`user_id.eq.${userId},friend_id.eq.${userId}`)
+        .eq("status", "accepted");
+      const friendIds = (friendships || []).map((f) =>
+        f.user_id === userId ? f.friend_id : f.user_id
+      );
+      const payload = { userId: String(userId), status };
+      for (const fid of friendIds) {
+        for (const sid of socketsForUser(fid)) {
+          io.to(sid).emit("friend:status", payload);
+        }
+      }
+    } catch (err) {
+      console.error("Periodic status notify failed:", err);
+    }
+  }
+}, 30000);
 
 // Game loop: batch-broadcast dirty player positions per map
 setInterval(() => {
