@@ -82,14 +82,14 @@ router.get("/", auth, async (req, res) => {
     if (allIds.length) {
       const { data: profiles } = await supabase
         .from("profiles")
-        .select("id, name, avatar, gender, customization")
+        .select("id, name, gender")
         .in("id", allIds);
       for (const p of profiles || []) profileMap[p.id] = p;
     }
 
     const toEntry = (id) => {
       const p = profileMap[id] || {};
-      return { id, name: p.name, avatar: p.avatar, gender: p.gender, outfit: extractOutfit(p.customization) };
+      return { id, name: p.name, gender: p.gender };
     };
 
     res.json({

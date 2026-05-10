@@ -248,11 +248,28 @@ router.get("/user", auth, async (req, res) => {
 
     const { data: user } = await supabase
       .from("profiles")
-      .select("id, name, gender, bio, selected_badge, customization")
+      .select("id, name, gender, bio, selected_badge")
       .ilike("name", name)
       .maybeSingle();
 
     if (!user) return res.status(404).json({ message: "User not found." });
+
+    const { data: equippedRows } = await supabase
+      .from("equipped_items")
+      .select("slot, item_id")
+      .eq("user_id", user.id);
+    const outfit = {};
+    if (equippedRows?.length) {
+      const { data: items } = await supabase
+        .from("items")
+        .select("id, image_url")
+        .in("id", equippedRows.map((r) => r.item_id));
+      const itemMap = new Map((items || []).map((i) => [i.id, i.image_url]));
+      for (const row of equippedRows) {
+        const imageUrl = itemMap.get(row.item_id);
+        if (imageUrl) outfit[row.slot] = { imageUrl };
+      }
+    }
 
     const { data: smRow } = await supabase
       .from("soulmates")
@@ -275,7 +292,7 @@ router.get("/user", auth, async (req, res) => {
         gender:       user.gender,
         bio:          user.bio || "",
         selectedBadge: user.selected_badge || null,
-        outfit:       extractOutfitShallow(user.customization),
+        outfit,
         soulMate,
       },
     });

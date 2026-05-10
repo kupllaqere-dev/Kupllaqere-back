@@ -153,52 +153,73 @@ router.get("/sent", auth, async (req, res) => {
   }
 });
 
-// GET /api/mail/thread/:threadId
+// GET /api/mail/thread/:threadId?limit=N&before=<iso>
 router.get("/thread/:threadId", auth, async (req, res) => {
   try {
     const { threadId } = req.params;
+    const limit  = req.query.limit  ? Math.min(100, parseInt(req.query.limit)  || 20) : null;
+    const before = req.query.before || null;
 
-    const { data: allMessages } = await supabase
+    // Fetch first message for participation check + thread metadata
+    const { data: firstMsg } = await supabase
       .from("mail")
-      .select("id, thread_id, from_id, to_id, subject, body, read, created_at")
+      .select("id, from_id, to_id, subject")
       .eq("thread_id", threadId)
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
 
-    if (!allMessages || !allMessages.length) {
-      return res.status(404).json({ message: "Thread not found." });
+    if (!firstMsg) return res.status(404).json({ message: "Thread not found." });
+    if (firstMsg.from_id !== req.userId && firstMsg.to_id !== req.userId) {
+      return res.status(403).json({ message: "Forbidden." });
     }
 
-    // Verify participation
-    const isParticipant = allMessages.some(
-      (m) => m.from_id === req.userId || m.to_id === req.userId
-    );
-    if (!isParticipant) return res.status(403).json({ message: "Forbidden." });
+    // Fetch messages newest-first so we can paginate backwards
+    let query = supabase
+      .from("mail")
+      .select("id, thread_id, from_id, to_id, body, read, created_at")
+      .eq("thread_id", threadId)
+      .order("created_at", { ascending: false });
 
-    // Fetch participant names
-    const participantIds = [...new Set(allMessages.flatMap((m) => [m.from_id, m.to_id]).filter(Boolean))];
+    if (before) query = query.lt("created_at", before);
+    if (limit)  query = query.limit(limit + 1); // +1 to detect hasMore
+
+    const { data: raw } = await query;
+    let msgs = raw || [];
+
+    let hasMore = false;
+    if (limit && msgs.length > limit) {
+      hasMore = true;
+      msgs = msgs.slice(0, limit);
+    }
+    msgs = msgs.reverse(); // back to chronological order
+
+    const participantIds = [...new Set(
+      [...msgs.flatMap((m) => [m.from_id, m.to_id]), firstMsg.from_id, firstMsg.to_id].filter(Boolean)
+    )];
     const { data: participants } = await supabase
       .from("profiles")
       .select("id, name")
       .in("id", participantIds);
     const nameOf = Object.fromEntries((participants || []).map((p) => [p.id, p.name]));
 
-    const first = allMessages[0];
-    const otherParticipantId = first.from_id === req.userId ? first.to_id : first.from_id;
+    const otherParticipantId = firstMsg.from_id === req.userId ? firstMsg.to_id : firstMsg.from_id;
 
     res.json({
       threadId,
-      subject: first.subject,
+      subject: firstMsg.subject,
       otherParticipant: {
-        id: otherParticipantId,
+        id:   otherParticipantId,
         name: nameOf[otherParticipantId] || "Deleted User",
       },
-      messages: allMessages.map((m) => ({
-        id:       m.id,
-        fromId:   m.from_id,
-        fromName: nameOf[m.from_id] || "Deleted User",
-        body:     m.body,
-        read:     m.read,
-        isFromMe: m.from_id === req.userId,
+      hasMore,
+      messages: msgs.map((m) => ({
+        id:        m.id,
+        fromId:    m.from_id,
+        fromName:  nameOf[m.from_id] || "Deleted User",
+        body:      m.body,
+        read:      m.read,
+        isFromMe:  m.from_id === req.userId,
         createdAt: m.created_at,
       })),
     });
