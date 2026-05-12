@@ -76,7 +76,7 @@ router.get("/:id/profile-view", async (req, res) => {
   try {
     const { data: profile, error } = await supabase
       .from("profiles")
-      .select("profile_view_locked, profile_pose_index, profile_zoom_index, profile_pan_x, profile_pan_y")
+      .select("profile_view_locked, profile_pose_index, profile_zoom_index, profile_pan_x, profile_pan_y, profile_theme")
       .eq("id", req.params.id)
       .maybeSingle();
 
@@ -89,6 +89,7 @@ router.get("/:id/profile-view", async (req, res) => {
       zoomIndex: profile.profile_zoom_index  ?? 0,
       panX:      profile.profile_pan_x       ?? 0,
       panY:      profile.profile_pan_y       ?? 0,
+      themeName: profile.profile_theme       ?? "Violet Dream",
     });
   } catch (err) {
     console.error("Profile view fetch error:", err);

@@ -418,6 +418,26 @@ router.delete("/profile-view", auth, async (req, res) => {
   }
 });
 
+// ── Save profile theme ────────────────────────────────────
+router.patch("/theme", auth, async (req, res) => {
+  try {
+    const { themeName } = req.body;
+    if (typeof themeName !== "string" || !themeName.trim())
+      return res.status(400).json({ message: "Invalid theme name." });
+
+    const { error } = await supabase
+      .from("profiles")
+      .update({ profile_theme: themeName.trim() })
+      .eq("id", req.userId);
+    if (error) throw error;
+
+    res.json({ themeName: themeName.trim() });
+  } catch (err) {
+    console.error("Theme update error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
 // ── Update presence status ────────────────────────────────
 const ALLOWED_PRESENCE = ["online", "away", "invisible"];
 
