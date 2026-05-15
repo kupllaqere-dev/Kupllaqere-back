@@ -125,6 +125,8 @@ router.get("/outfit", auth, async (req, res) => {
   }
 });
 
+const APPEARANCE_SUBS = new Set(["eyes", "eyebrows", "nose", "mouth", "beard"]);
+
 // PUT /api/items/outfit — equip outfit
 router.put("/outfit", auth, async (req, res) => {
   try {
@@ -134,9 +136,10 @@ router.put("/outfit", auth, async (req, res) => {
     }
 
     const itemEntries = [];
-    for (const [category, value] of Object.entries(outfit)) {
-      if (!CATEGORY_SUBCATEGORIES[category]) {
-        return res.status(400).json({ message: `Invalid category: ${category}` });
+    for (const [slotKey, value] of Object.entries(outfit)) {
+      const isAppearanceSub = APPEARANCE_SUBS.has(slotKey);
+      if (!isAppearanceSub && !CATEGORY_SUBCATEGORIES[slotKey]) {
+        return res.status(400).json({ message: `Invalid category: ${slotKey}` });
       }
       const { data: item } = await supabase
         .from("items")
@@ -144,10 +147,14 @@ router.put("/outfit", auth, async (req, res) => {
         .eq("id", value.itemId)
         .maybeSingle();
       if (!item) return res.status(400).json({ message: `Item not found: ${value.itemId}` });
-      if (item.category !== category) {
-        return res.status(400).json({ message: `Item ${value.itemId} is not a ${category} item.` });
+      if (isAppearanceSub) {
+        if (item.category !== "appearance" || item.subcategory !== slotKey) {
+          return res.status(400).json({ message: `Item ${value.itemId} is not a ${slotKey} item.` });
+        }
+      } else if (item.category !== slotKey) {
+        return res.status(400).json({ message: `Item ${value.itemId} is not a ${slotKey} item.` });
       }
-      itemEntries.push({ category, item });
+      itemEntries.push({ slotKey, item });
     }
 
     // Replace all equipped items for this user
@@ -155,9 +162,9 @@ router.put("/outfit", auth, async (req, res) => {
     if (deleteErr) throw deleteErr;
 
     if (itemEntries.length > 0) {
-      const rows = itemEntries.map(({ category, item }) => ({
+      const rows = itemEntries.map(({ slotKey, item }) => ({
         user_id:     req.userId,
-        slot:        category,
+        slot:        slotKey,
         subcategory: item.subcategory,
         item_id:     item.id,
       }));
