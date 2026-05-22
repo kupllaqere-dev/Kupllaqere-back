@@ -118,9 +118,6 @@ function socketsForUser(userId) {
   return set ? Array.from(set) : [];
 }
 
-const dirtyPlayers = new Set();
-const TICK_RATE = 50;
-
 const chatHistory = [];
 const MAX_CHAT_HISTORY = 50;
 
@@ -148,14 +145,10 @@ io.on("connection", (socket) => {
   console.log(`Player connected: ${socket.id}`);
 
   socket.on("player:join", async (data) => {
-    const map = data.map || "main";
     const player = {
       id:            socket.id,
       userId:        data.userId || null,
       name:          data.name || "Anonymous",
-      x:             data.x || 0,
-      y:             data.y || 0,
-      map,
       outfit:        {},
       gender:        data.gender === "male" ? "male" : "female",
       bio:           "",
@@ -237,76 +230,26 @@ io.on("connection", (socket) => {
     }
 
     players.set(socket.id, player);
-    socket.join(map);
 
-    const playersOnMap = Array.from(players.values()).filter((p) => p.map === map);
-    socket.emit("game:state", { you: player, players: playersOnMap });
-    socket.to(map).emit("player:joined", player);
+    socket.emit("game:state", { you: player, players: Array.from(players.values()) });
+    socket.broadcast.emit("player:joined", player);
 
-    console.log(`${player.name} joined map "${map}" (${players.size} players online)`);
+    console.log(`${player.name} joined (${players.size} players online)`);
   });
 
-  socket.on("player:update", (data) => {
+  socket.on("player:move", (data) => {
     const player = players.get(socket.id);
     if (!player) return;
-    player.x         = data.x         ?? player.x;
-    player.y         = data.y         ?? player.y;
-    player.frame     = data.frame     ?? player.frame;
-    player.direction = data.direction ?? player.direction;
-    player.anim      = data.anim      ?? null;
-    dirtyPlayers.add(socket.id);
-    if (player.userId) online.updateActivity(player.userId);
-  });
-
-  socket.on("player:teleport", (data) => {
-    const player = players.get(socket.id);
-    if (!player) return;
-
-    const fromMap = player.map;
-    const toMap   = data.map || fromMap;
-    const from    = { x: player.x, y: player.y, map: fromMap };
-
     player.x = data.x;
     player.y = data.y;
-
-    if (toMap !== fromMap) {
-      socket.to(fromMap).emit("player:left", { id: socket.id });
-      socket.leave(fromMap);
-      player.map = toMap;
-      socket.join(toMap);
-      socket.to(toMap).emit("player:joined", player);
-    } else {
-      socket.to(fromMap).emit("player:teleported", {
-        id: socket.id,
-        from,
-        to: { x: player.x, y: player.y, map: toMap },
-      });
-    }
-
-    const playersOnNewMap = Array.from(players.values()).filter((p) => p.map === toMap);
-    socket.emit("player:teleported", {
-      id: socket.id,
-      from,
-      to: { x: player.x, y: player.y, map: toMap },
-      players: playersOnNewMap,
-    });
-  });
-
-  socket.on("player:action", (data) => {
-    const player = players.get(socket.id);
-    if (!player) return;
-    socket.to(player.map).emit("player:action", {
-      id:      socket.id,
-      action:  data.action,
-      payload: data.payload,
-    });
+    socket.broadcast.emit("player:move", { id: socket.id, x: data.x, y: data.y, anim: data.anim, frame: data.frame, t: data.t });
   });
 
   socket.on("player:outfit", (data) => {
     const player = players.get(socket.id);
     if (!player) return;
     player.outfit = data.outfit || {};
-    socket.to(player.map).emit("player:outfit", { id: socket.id, outfit: player.outfit });
+    socket.broadcast.emit("player:outfit", { id: socket.id, outfit: player.outfit });
   });
 
   socket.on("chat:history", () => {
@@ -389,7 +332,7 @@ io.on("connection", (socket) => {
           })();
         }
       }
-      socket.to(player.map).emit("player:left", { id: socket.id });
+      socket.broadcast.emit("player:left", { id: socket.id });
     }
 
     console.log(`${player?.name || "Unknown"} disconnected (${players.size} players online)`);
@@ -421,37 +364,6 @@ setInterval(async () => {
     }
   }
 }, 30000);
-
-// Game loop: batch-broadcast dirty player positions per map
-setInterval(() => {
-  if (dirtyPlayers.size === 0) return;
-
-  const byMap       = new Map();
-  const dirtyIdsByMap = new Map();
-  for (const id of dirtyPlayers) {
-    const p = players.get(id);
-    if (!p) continue;
-    let list = byMap.get(p.map);
-    if (!list) {
-      list = [];
-      byMap.set(p.map, list);
-      dirtyIdsByMap.set(p.map, new Set());
-    }
-    list.push({ id: p.id, x: p.x, y: p.y, frame: p.frame, direction: p.direction, anim: p.anim });
-    dirtyIdsByMap.get(p.map).add(p.id);
-  }
-  dirtyPlayers.clear();
-
-  for (const [map, updates] of byMap) {
-    const dirtyIds  = dirtyIdsByMap.get(map);
-    const excludeIds = Array.from(dirtyIds);
-    io.to(map).except(excludeIds).emit("players:updated", updates);
-    for (const senderId of dirtyIds) {
-      const filtered = updates.filter((u) => u.id !== senderId);
-      if (filtered.length > 0) io.to(senderId).emit("players:updated", filtered);
-    }
-  }
-}, TICK_RATE);
 
 // Start server (no longer needs to wait for DB connection)
 server.listen(PORT, () => {
