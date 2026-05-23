@@ -9,6 +9,24 @@ function isValidId(id) {
   return typeof id === "string" && UUID_RE.test(id);
 }
 
+// In-memory cache for buildOwnState — avoids repeated DB round trips on profile open.
+// Invalidated on any soulmate mutation for the affected users.
+const ownStateCache = new Map();
+const OWN_STATE_TTL = 8000;
+
+function getCachedOwnState(userId) {
+  const entry = ownStateCache.get(userId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { ownStateCache.delete(userId); return null; }
+  return entry.data;
+}
+function setCachedOwnState(userId, data) {
+  ownStateCache.set(userId, { data, expiresAt: Date.now() + OWN_STATE_TTL });
+}
+function invalidateOwnState(...userIds) {
+  for (const uid of userIds) if (uid) ownStateCache.delete(uid);
+}
+
 function notifySoulMateChanged(req, userIds) {
   const io = req.app.locals.io;
   const socketsForUser = req.app.locals.socketsForUser;
@@ -35,80 +53,90 @@ function notifySoulMateRequest(req, toUserId, fromName) {
 // Build current soulmate state for a user from the soulmates table.
 // soulmates rows: { user_id, partner_id, status: 'pending'|'accepted' }
 async function buildOwnState(userId) {
-  const { data: acceptedRows } = await supabase
-    .from("soulmates")
-    .select("user_id, partner_id")
-    .or(`user_id.eq.${userId},partner_id.eq.${userId}`)
-    .eq("status", "accepted")
-    .limit(1);
+  const cached = getCachedOwnState(userId);
+  if (cached) return cached;
+
+  // Run all three soulmates queries in parallel
+  const [{ data: acceptedRows }, { data: sentRow }, { data: receivedRows }] = await Promise.all([
+    supabase
+      .from("soulmates")
+      .select("user_id, partner_id")
+      .or(`user_id.eq.${userId},partner_id.eq.${userId}`)
+      .eq("status", "accepted")
+      .limit(1),
+    supabase
+      .from("soulmates")
+      .select("partner_id")
+      .eq("user_id", userId)
+      .eq("status", "pending")
+      .maybeSingle(),
+    supabase
+      .from("soulmates")
+      .select("user_id")
+      .eq("partner_id", userId)
+      .eq("status", "pending"),
+  ]);
+
   const acceptedRow = acceptedRows?.[0] ?? null;
+  const partnerId = acceptedRow
+    ? acceptedRow.user_id === userId
+      ? acceptedRow.partner_id
+      : acceptedRow.user_id
+    : null;
+  const fromIds = receivedRows?.length ? receivedRows.map((r) => r.user_id) : [];
 
-  let mine = null;
-  if (acceptedRow) {
-    const partnerId = acceptedRow.user_id === userId ? acceptedRow.partner_id : acceptedRow.user_id;
-    const { data: sm } = await supabase
-      .from("profiles")
-      .select("id, name")
-      .eq("id", partnerId)
-      .single();
-    if (sm) mine = { id: sm.id, name: sm.name };
-  }
+  // Fetch all needed profiles in parallel
+  const [mineRes, sentRes, receivedRes] = await Promise.all([
+    partnerId
+      ? supabase.from("profiles").select("id, name").eq("id", partnerId).single()
+      : Promise.resolve({ data: null }),
+    sentRow
+      ? supabase.from("profiles").select("id, name").eq("id", sentRow.partner_id).single()
+      : Promise.resolve({ data: null }),
+    fromIds.length
+      ? supabase.from("profiles").select("id, name").in("id", fromIds)
+      : Promise.resolve({ data: [] }),
+  ]);
 
-  // My outgoing pending request (I am user_id)
-  const { data: sentRow } = await supabase
-    .from("soulmates")
-    .select("partner_id")
-    .eq("user_id", userId)
-    .eq("status", "pending")
-    .maybeSingle();
+  const mine = mineRes.data ? { id: mineRes.data.id, name: mineRes.data.name } : null;
+  const sent = sentRes.data ? { id: sentRes.data.id, name: sentRes.data.name } : null;
+  const received = (receivedRes.data || []).map((u) => ({ id: u.id, name: u.name }));
 
-  let sent = null;
-  if (sentRow) {
-    const { data: sentUser } = await supabase
-      .from("profiles")
-      .select("id, name")
-      .eq("id", sentRow.partner_id)
-      .single();
-    if (sentUser) sent = { id: sentUser.id, name: sentUser.name };
-  }
-
-  // Incoming pending requests (I am partner_id)
-  const { data: receivedRows } = await supabase
-    .from("soulmates")
-    .select("user_id")
-    .eq("partner_id", userId)
-    .eq("status", "pending");
-
-  let received = [];
-  if (receivedRows && receivedRows.length) {
-    const fromIds = receivedRows.map((r) => r.user_id);
-    const { data: fromUsers } = await supabase
-      .from("profiles")
-      .select("id, name")
-      .in("id", fromIds);
-    received = (fromUsers || []).map((u) => ({ id: u.id, name: u.name }));
-  }
-
-  return { mine, sent, received };
+  const result = { mine, sent, received };
+  setCachedOwnState(userId, result);
+  return result;
 }
 
 // GET /api/soulmate?targetId=...
 router.get("/", auth, async (req, res) => {
   try {
-    const own = await buildOwnState(req.userId);
+    const { targetId } = req.query;
+
+    if (targetId && !isValidId(targetId)) {
+      return res.status(400).json({ message: "Invalid target id." });
+    }
+
+    // Run own state + target queries in parallel
+    const [own, { data: target }, { data: targetSMRow }] = await Promise.all([
+      buildOwnState(req.userId),
+      targetId
+        ? supabase.from("profiles").select("id, name").eq("id", targetId).maybeSingle()
+        : Promise.resolve({ data: null }),
+      targetId
+        ? supabase
+            .from("soulmates")
+            .select("user_id, partner_id")
+            .or(`user_id.eq.${targetId},partner_id.eq.${targetId}`)
+            .eq("status", "accepted")
+            .maybeSingle()
+        : Promise.resolve({ data: null }),
+    ]);
+
     if (!own) return res.status(404).json({ message: "User not found." });
 
     const out = { ...own };
-    const { targetId } = req.query;
 
     if (targetId) {
-      if (!isValidId(targetId)) return res.status(400).json({ message: "Invalid target id." });
-
-      const { data: target } = await supabase
-        .from("profiles")
-        .select("id, name")
-        .eq("id", targetId)
-        .maybeSingle();
       if (!target) return res.status(404).json({ message: "Target not found." });
 
       let relationship = "none";
@@ -121,14 +149,6 @@ router.get("/", auth, async (req, res) => {
       } else if (own.received.some((r) => r.id === targetId)) {
         relationship = "they_sent";
       }
-
-      // Look up target's accepted soulmate from the table
-      const { data: targetSMRow } = await supabase
-        .from("soulmates")
-        .select("user_id, partner_id")
-        .or(`user_id.eq.${targetId},partner_id.eq.${targetId}`)
-        .eq("status", "accepted")
-        .maybeSingle();
 
       let targetSoulMate = null;
       if (targetSMRow) {
@@ -205,6 +225,7 @@ router.post("/request", auth, async (req, res) => {
         .eq("status", "pending");
       const { error: acceptErr } = await supabase.from("soulmates").insert({ user_id: targetId, partner_id: req.userId, status: "accepted" });
       if (acceptErr) { console.error("Soulmate accept insert error:", acceptErr); return res.status(500).json({ message: "Server error." }); }
+      invalidateOwnState(req.userId, targetId);
       notifySoulMateChanged(req, [req.userId, targetId]);
       return res.json({ status: "accepted" });
     }
@@ -220,12 +241,14 @@ router.post("/request", auth, async (req, res) => {
       await supabase.from("soulmates").delete()
         .eq("user_id", req.userId)
         .eq("status", "pending");
+      invalidateOwnState(req.userId, prevSent.partner_id);
       notifySoulMateChanged(req, [prevSent.partner_id]);
     }
 
     const { data: me } = await supabase.from("profiles").select("name").eq("id", req.userId).single();
     const { error: insertErr } = await supabase.from("soulmates").insert({ user_id: req.userId, partner_id: targetId, status: "pending" });
     if (insertErr) { console.error("Soulmate request insert error:", insertErr); return res.status(500).json({ message: "Server error." }); }
+    invalidateOwnState(req.userId, targetId);
     notifySoulMateChanged(req, [req.userId, targetId]);
     notifySoulMateRequest(req, targetId, me?.name || "Someone");
     res.json({ status: "sent" });
@@ -285,6 +308,7 @@ router.post("/accept", auth, async (req, res) => {
     const { error: acceptErr } = await supabase.from("soulmates").insert({ user_id: userId, partner_id: req.userId, status: "accepted" });
     if (acceptErr) { console.error("Soulmate accept insert error:", acceptErr); return res.status(500).json({ message: "Server error." }); }
 
+    invalidateOwnState(...notifyIds);
     notifySoulMateChanged(req, Array.from(notifyIds));
     res.json({ status: "accepted" });
   } catch (err) {
@@ -304,6 +328,7 @@ router.post("/decline", auth, async (req, res) => {
       .eq("partner_id", req.userId)
       .eq("status", "pending");
 
+    invalidateOwnState(req.userId, userId);
     notifySoulMateChanged(req, [req.userId, userId]);
     res.json({ status: "declined" });
   } catch (err) {
@@ -328,6 +353,7 @@ router.post("/cancel", auth, async (req, res) => {
       .eq("user_id", req.userId)
       .eq("status", "pending");
 
+    invalidateOwnState(req.userId, sentRow.partner_id);
     notifySoulMateChanged(req, [req.userId, sentRow.partner_id]);
     res.json({ status: "cancelled" });
   } catch (err) {
@@ -354,6 +380,7 @@ router.delete("/", auth, async (req, res) => {
       .or(`user_id.eq.${req.userId},partner_id.eq.${req.userId}`)
       .eq("status", "accepted");
 
+    invalidateOwnState(req.userId, partnerId);
     notifySoulMateChanged(req, [req.userId, partnerId]);
     res.json({ status: "removed" });
   } catch (err) {
