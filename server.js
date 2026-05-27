@@ -296,6 +296,47 @@ io.on("connection", (socket) => {
     socket.emit("chat:whisper", whisper);
   });
 
+  // ── Chess ──────────────────────────────────────────────────────────────
+  socket.on("chess:invite", ({ targetSocketId }) => {
+    const sender = players.get(socket.id);
+    if (!sender) return;
+    const targetSocket = io.sockets.sockets.get(targetSocketId);
+    if (!targetSocket) return;
+    targetSocket.emit("chess:invite:received", {
+      inviterSocketId: socket.id,
+      inviter: { name: sender.name, gender: sender.gender, outfit: sender.outfit },
+    });
+  });
+
+  socket.on("chess:decline", ({ inviterSocketId }) => {
+    const sender = players.get(socket.id);
+    const inviterSocket = io.sockets.sockets.get(inviterSocketId);
+    if (!inviterSocket) return;
+    inviterSocket.emit("chess:decline:received", { declinerName: sender?.name || "Player" });
+  });
+
+  socket.on("chess:accept", ({ inviterSocketId }) => {
+    const sender = players.get(socket.id);
+    const inviterSocket = io.sockets.sockets.get(inviterSocketId);
+    if (!inviterSocket) return;
+    inviterSocket.emit("chess:accept:received", {
+      accepterSocketId: socket.id,
+      accepter: { name: sender?.name || "Player", gender: sender?.gender || "female", outfit: sender?.outfit || {} },
+    });
+  });
+
+  socket.on("chess:move", ({ opponentSocketId, from, to, promotion }) => {
+    const opponentSocket = io.sockets.sockets.get(opponentSocketId);
+    if (!opponentSocket) return;
+    opponentSocket.emit("chess:move:received", { from, to, promotion: promotion || null });
+  });
+
+  socket.on("chess:resign", ({ opponentSocketId }) => {
+    const opponentSocket = io.sockets.sockets.get(opponentSocketId);
+    if (!opponentSocket) return;
+    opponentSocket.emit("chess:resign:received", {});
+  });
+
   socket.on("disconnect", () => {
     const player = players.get(socket.id);
     players.delete(socket.id);
