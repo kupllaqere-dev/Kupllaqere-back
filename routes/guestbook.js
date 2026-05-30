@@ -9,7 +9,10 @@ function isValidId(id) {
   return typeof id === "string" && UUID_RE.test(id);
 }
 
-// GET /api/guestbook/:userId
+const MSG_MAX = 200;
+
+// ── GET /api/guestbook/:userId ────────────────────────────────────────────
+// Returns all comments for a profile, mapped to camelCase for the frontend.
 router.get("/:userId", auth, async (req, res) => {
   try {
     const { userId } = req.params;
@@ -17,18 +20,29 @@ router.get("/:userId", auth, async (req, res) => {
 
     const { data: comments, error } = await supabase
       .from("guestbook_comments")
-      .select("*")
+      .select("id, author_id, author_name, message, created_at, profile_user_id")
       .eq("profile_user_id", userId)
       .order("created_at", { ascending: false });
+
     if (error) throw error;
 
-    res.json({ comments: comments || [] });
+    // Map to camelCase so the frontend can use consistent field names
+    const mapped = (comments || []).map(c => ({
+      _id:           c.id,
+      authorId:      c.author_id,
+      authorName:    c.author_name,
+      message:       c.message,
+      createdAt:     c.created_at,
+      profileUserId: c.profile_user_id,
+    }));
+
+    res.json({ comments: mapped });
   } catch {
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// POST /api/guestbook/:userId
+// ── POST /api/guestbook/:userId ───────────────────────────────────────────
 router.post("/:userId", auth, async (req, res) => {
   try {
     const { userId } = req.params;
@@ -38,8 +52,8 @@ router.post("/:userId", auth, async (req, res) => {
     if (!message || typeof message !== "string" || !message.trim()) {
       return res.status(400).json({ message: "Message is required" });
     }
-    if (message.trim().length > 100) {
-      return res.status(400).json({ message: "Message too long (max 100 characters)" });
+    if (message.trim().length > MSG_MAX) {
+      return res.status(400).json({ message: `Message too long (max ${MSG_MAX} characters)` });
     }
 
     const [{ data: profileUser }, { data: author }] = await Promise.all([
@@ -61,13 +75,23 @@ router.post("/:userId", auth, async (req, res) => {
       .single();
     if (error) throw error;
 
-    res.status(201).json({ comment });
+    res.status(201).json({
+      comment: {
+        _id:           comment.id,
+        authorId:      comment.author_id,
+        authorName:    comment.author_name,
+        message:       comment.message,
+        createdAt:     comment.created_at,
+        profileUserId: comment.profile_user_id,
+      },
+    });
   } catch {
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// DELETE /api/guestbook/:commentId
+// ── DELETE /api/guestbook/:commentId ─────────────────────────────────────
+// Allowed if the caller is the profile owner OR the comment's author.
 router.delete("/:commentId", auth, async (req, res) => {
   try {
     const { commentId } = req.params;
@@ -75,14 +99,17 @@ router.delete("/:commentId", auth, async (req, res) => {
 
     const { data: comment, error: fetchErr } = await supabase
       .from("guestbook_comments")
-      .select("id, profile_user_id")
+      .select("id, profile_user_id, author_id")
       .eq("id", commentId)
       .maybeSingle();
 
     if (fetchErr || !comment) return res.status(404).json({ message: "Comment not found" });
 
-    if (comment.profile_user_id !== req.userId) {
-      return res.status(403).json({ message: "Only the profile owner can delete comments" });
+    const isOwner  = String(comment.profile_user_id) === String(req.userId);
+    const isAuthor = String(comment.author_id)       === String(req.userId);
+
+    if (!isOwner && !isAuthor) {
+      return res.status(403).json({ message: "Not authorized to delete this comment" });
     }
 
     await supabase.from("guestbook_comments").delete().eq("id", commentId);

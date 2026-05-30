@@ -14,9 +14,12 @@ const adminRoutes = require("./routes/admin");
 const creatorRoutes = require("./routes/creator");
 const storeRoutes = require("./routes/store");
 const guestBookRoutes = require("./routes/guestbook");
+const { router: guestbookStickerRoutes, VALID_ASSET_IDS: STICKER_ASSET_IDS, MAX_STICKERS } = require("./routes/guestbook-stickers");
 const supabase = require("./lib/supabase");
 const { CATEGORY_SUBCATEGORIES } = require("./lib/categories");
 const online = require("./lib/online");
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Build full outfit object from equipped_items table
 async function buildOutfit(userId) {
@@ -136,6 +139,7 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/creator", creatorRoutes);
 app.use("/api/store", storeRoutes);
 app.use("/api/guestbook", guestBookRoutes);
+app.use("/api/guestbook-stickers", guestbookStickerRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", players: players.size });
@@ -335,6 +339,139 @@ io.on("connection", (socket) => {
     const opponentSocket = io.sockets.sockets.get(opponentSocketId);
     if (!opponentSocket) return;
     opponentSocket.emit("chess:resign:received", {});
+  });
+
+  // ── Guestbook stickers ──────────────────────────────────────────────────
+
+  socket.on("guestbook:join", ({ profileUserId }) => {
+    if (!profileUserId || !UUID_RE.test(profileUserId)) return;
+    socket.join(`guestbook:${profileUserId}`);
+  });
+
+  socket.on("guestbook:leave", ({ profileUserId }) => {
+    if (!profileUserId || !UUID_RE.test(profileUserId)) return;
+    socket.leave(`guestbook:${profileUserId}`);
+  });
+
+  socket.on("guestbook:addSticker", async (data) => {
+    const player = players.get(socket.id);
+    if (!player?.userId) return;
+
+    const { profileUserId, sticker_asset_id, x, y, rotation, scale, z_index } = data || {};
+
+    // ── Server-side validation (never trust client) ────────────────────
+    if (!profileUserId || !UUID_RE.test(profileUserId)) return;
+    if (!STICKER_ASSET_IDS.has(sticker_asset_id)) return;
+    if (typeof x !== "number" || x < 0 || x > 1) return;
+    if (typeof y !== "number" || y < 0 || y > 1) return;
+
+    const safeRotation = typeof rotation === "number" ? rotation % 360 : 0;
+    const safeScale    = Math.max(0.35, Math.min(2.8, typeof scale === "number" ? scale : 1));
+    const safeZIndex   = Math.max(0, Math.min(100000, typeof z_index === "number" ? z_index : 0));
+
+    try {
+      // Get or create the guestbook row for this profile
+      let { data: gb } = await supabase
+        .from("guestbooks")
+        .select("id")
+        .eq("profile_user_id", profileUserId)
+        .maybeSingle();
+
+      if (!gb) {
+        const { data: newGb, error: gbErr } = await supabase
+          .from("guestbooks")
+          .insert({ profile_user_id: profileUserId })
+          .select("id")
+          .single();
+        if (gbErr) throw gbErr;
+        gb = newGb;
+      }
+
+      // Enforce the 100-sticker cap
+      const { count, error: cntErr } = await supabase
+        .from("guestbook_stickers")
+        .select("id", { count: "exact", head: true })
+        .eq("guestbook_id", gb.id);
+      if (cntErr) throw cntErr;
+      if (count >= MAX_STICKERS) {
+        socket.emit("guestbook:error", { message: "This guestbook is full (100 stickers max)." });
+        return;
+      }
+
+      // Fetch placer name
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("name")
+        .eq("id", player.userId)
+        .single();
+
+      const { data: sticker, error: insErr } = await supabase
+        .from("guestbook_stickers")
+        .insert({
+          guestbook_id:        gb.id,
+          placed_by_user_id:   player.userId,
+          placed_by_name:      profile?.name || "Player",
+          sticker_asset_id,
+          x,
+          y,
+          rotation:            safeRotation,
+          scale:               safeScale,
+          z_index:             safeZIndex,
+          placement_finalized: true,
+        })
+        .select()
+        .single();
+      if (insErr) throw insErr;
+
+      // Broadcast to every client viewing this guestbook
+      io.to(`guestbook:${profileUserId}`).emit("guestbook:stickerAdded", sticker);
+    } catch (err) {
+      console.error("guestbook:addSticker error:", err);
+      socket.emit("guestbook:error", { message: "Failed to place sticker." });
+    }
+  });
+
+  socket.on("guestbook:deleteSticker", async ({ stickerId } = {}) => {
+    const player = players.get(socket.id);
+    if (!player?.userId) return;
+    if (!stickerId || !UUID_RE.test(stickerId)) return;
+
+    try {
+      const { data: sticker, error: fetchErr } = await supabase
+        .from("guestbook_stickers")
+        .select("id, guestbook_id, placed_by_user_id, placement_finalized")
+        .eq("id", stickerId)
+        .maybeSingle();
+
+      if (fetchErr || !sticker) return;
+
+      // Server enforces: only placer or profile owner may delete
+      const isPlacer = String(sticker.placed_by_user_id) === String(player.userId);
+
+      const { data: gb } = await supabase
+        .from("guestbooks")
+        .select("profile_user_id")
+        .eq("id", sticker.guestbook_id)
+        .single();
+
+      const isOwner = gb && String(gb.profile_user_id) === String(player.userId);
+
+      if (!isPlacer && !isOwner) {
+        socket.emit("guestbook:error", { message: "Not authorized to delete this sticker." });
+        return;
+      }
+
+      const { error: delErr } = await supabase
+        .from("guestbook_stickers")
+        .delete()
+        .eq("id", stickerId);
+
+      if (delErr) throw delErr;
+
+      io.to(`guestbook:${gb.profile_user_id}`).emit("guestbook:stickerDeleted", { stickerId });
+    } catch (err) {
+      console.error("guestbook:deleteSticker error:", err);
+    }
   });
 
   socket.on("disconnect", () => {
