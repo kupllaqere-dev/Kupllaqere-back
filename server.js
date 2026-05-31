@@ -157,6 +157,8 @@ io.on("connection", (socket) => {
       gender:        data.gender === "male" ? "male" : "female",
       bio:           "",
       selectedBadge: null,
+      x:             typeof data.x === "number" ? data.x : null,
+      y:             typeof data.y === "number" ? data.y : null,
     };
 
     if (data.userId) {
