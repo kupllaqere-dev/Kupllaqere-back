@@ -5,7 +5,7 @@ const { v4: uuidv4 } = require("uuid");
 const auth = require("../middleware/auth");
 const supabase = require("../lib/supabase");
 const { uploadFile } = require("../lib/storage");
-const { CATEGORY_SUBCATEGORIES } = require("../lib/categories");
+const { CATEGORY_SUBCATEGORIES, VALID_SLOTS } = require("../lib/categories");
 
 const router = express.Router();
 
@@ -100,7 +100,7 @@ router.get("/outfit", auth, async (req, res) => {
   try {
     const { data: equippedRows, error } = await supabase
       .from("equipped_items")
-      .select("slot, item_id")
+      .select("slot, item_id, subcategory")
       .eq("user_id", req.userId);
     if (error) throw error;
 
@@ -114,7 +114,7 @@ router.get("/outfit", auth, async (req, res) => {
       const itemMap = new Map((items || []).map((i) => [i.id, i.image_url]));
       for (const row of equippedRows) {
         const imageUrl = itemMap.get(row.item_id);
-        if (imageUrl) outfit[row.slot] = { itemId: row.item_id, imageUrl };
+        if (imageUrl) outfit[row.slot] = { itemId: row.item_id, imageUrl, subcategory: row.subcategory };
       }
     }
 
@@ -124,8 +124,6 @@ router.get("/outfit", auth, async (req, res) => {
     res.status(500).json({ message: "Server error." });
   }
 });
-
-const APPEARANCE_SUBS = new Set(["eyes", "eyebrows", "nose", "mouth", "beard"]);
 
 // PUT /api/items/outfit — equip outfit
 router.put("/outfit", auth, async (req, res) => {
@@ -137,9 +135,9 @@ router.put("/outfit", auth, async (req, res) => {
 
     const itemEntries = [];
     for (const [slotKey, value] of Object.entries(outfit)) {
-      const isAppearanceSub = APPEARANCE_SUBS.has(slotKey);
-      if (!isAppearanceSub && !CATEGORY_SUBCATEGORIES[slotKey]) {
-        return res.status(400).json({ message: `Invalid category: ${slotKey}` });
+      const slotInfo = VALID_SLOTS[slotKey];
+      if (!slotInfo) {
+        return res.status(400).json({ message: `Invalid slot: ${slotKey}` });
       }
       const { data: item } = await supabase
         .from("items")
@@ -147,12 +145,14 @@ router.put("/outfit", auth, async (req, res) => {
         .eq("id", value.itemId)
         .maybeSingle();
       if (!item) return res.status(400).json({ message: `Item not found: ${value.itemId}` });
-      if (isAppearanceSub) {
-        if (item.category !== "appearance" || item.subcategory !== slotKey) {
-          return res.status(400).json({ message: `Item ${value.itemId} is not a ${slotKey} item.` });
-        }
-      } else if (item.category !== slotKey) {
-        return res.status(400).json({ message: `Item ${value.itemId} is not a ${slotKey} item.` });
+      if (item.category !== slotInfo.category) {
+        return res.status(400).json({ message: `Item ${value.itemId} does not belong to category "${slotInfo.category}".` });
+      }
+      if (slotInfo.subcategory && item.subcategory !== slotInfo.subcategory) {
+        return res.status(400).json({ message: `Item ${value.itemId} subcategory must be "${slotInfo.subcategory}".` });
+      }
+      if (slotInfo.subcategories && !slotInfo.subcategories.includes(item.subcategory)) {
+        return res.status(400).json({ message: `Item ${value.itemId} subcategory must be one of: ${slotInfo.subcategories.join(", ")}.` });
       }
       itemEntries.push({ slotKey, item });
     }
