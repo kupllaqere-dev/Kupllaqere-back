@@ -179,7 +179,13 @@ io.on("connection", (socket) => {
           online.setManualStatus(data.userId, profile.presence_status || "online");
           online.add(data.userId);
 
+          // Kick any existing sessions for this user before registering the new socket
+          const existingSocketIds = socketsForUser(data.userId);
           const wasFirstSocket = addUserSocket(data.userId, socket.id);
+          for (const oldSid of existingSocketIds) {
+            io.to(oldSid).emit("session:kicked");
+            io.sockets.sockets.get(oldSid)?.disconnect(true);
+          }
           const effectiveStatus = online.getEffectiveStatus(data.userId);
           online.setLastEmitted(data.userId, effectiveStatus);
 
